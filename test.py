@@ -1,4 +1,4 @@
 import time
 while True:
-    print("OTA test after set up 6 python test")
+    print("OTA test after set up from windoes")
     time.sleep(5)
