@@ -1,4 +1,4 @@
 import time
 while True:
-    print("OTA test after set up from windoes")
+    print("OTA test 1 for windows script")
     time.sleep(5)
