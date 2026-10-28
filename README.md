@@ -1,6 +1,6 @@
 # OTA for IoT devices
 
-Pushes code updates to the Raspberry Pi devices (thermopile, PCS) over MQTT.
+Pushes code updates to the CM4/Raspberry Pi devices (thermopile, PCS) over MQTT.
 
 ```
 laptop                         MQTT broker                    device
