@@ -8,6 +8,7 @@ import time
 import json
 import hashlib
 import uuid
+from fnmatch import fnmatch
 from pathlib import Path
 
 import paho.mqtt.client as paho
@@ -23,6 +24,17 @@ BRANCHES = ['thermophileTesting']                             # branch to track 
 # What to include in the tar. By default, whole repo (excluding .git).
 # You can restrict to specific subfolders or file patterns if you like.
 INCLUDE_PATHS = []  # e.g., ["src", "scripts", "requirements.txt"]
+
+# Never shipped: device-owned or local-only files. Each device keeps its own
+# .env, logs and database; the OTA agent also refuses to take these from a
+# bundle, this just stops the laptop's copies from leaving the laptop.
+EXCLUDED_DIR_NAMES = frozenset({".git", "logs", "__pycache__"})
+EXCLUDED_FILE_PATTERNS = (
+    ".env",
+    "*.db", "*.db-wal", "*.db-shm", "*.db-journal",
+    "*.pkl",
+    "*.pyc",
+)
 
 ARCHIVE_BASENAME = "repo_bundle"           # archive base name (timestamp & commit appended)
 OUTPUT_DIR = "C:/Users/HP/Desktop/github/"  # or any writable path                         # None = temp dir; or set a path to keep archives
@@ -70,11 +82,15 @@ def make_tar_gz(source_dir: Path, include_paths, out_dir: Path, base_name: str) 
     archive_path = out_dir / archive_name
 
     def should_include(p: Path) -> bool:
-        # Exclude .git directory and the output archive itself
-        parts = p.parts
-        if ".git" in parts:
+        # Exclude device-owned/local-only files and the output archive itself.
+        # Check only the path inside the repo, so a parent folder named e.g.
+        # "logs" on the laptop doesn't exclude everything.
+        relative_parts = p.relative_to(source_dir).parts
+        if any(part in EXCLUDED_DIR_NAMES for part in relative_parts[:-1]):
             return False
-        if archive_path.samefile(p) if p.exists() else False:
+        if any(fnmatch(p.name, pattern) for pattern in EXCLUDED_FILE_PATTERNS):
+            return False
+        if archive_path.exists() and p.exists() and archive_path.samefile(p):
             return False
         return True
 
@@ -88,8 +104,8 @@ def make_tar_gz(source_dir: Path, include_paths, out_dir: Path, base_name: str) 
                 if src.is_dir():
                     for root, dirs, files in os.walk(src):
                         root_path = Path(root)
-                        # Filter out .git dirs
-                        dirs[:] = [d for d in dirs if d != ".git"]
+                        # Skip excluded dirs (.git, logs, __pycache__)
+                        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIR_NAMES]
                         for f in files:
                             fp = root_path / f
                             if should_include(fp):
@@ -98,10 +114,10 @@ def make_tar_gz(source_dir: Path, include_paths, out_dir: Path, base_name: str) 
                     if should_include(src):
                         tar.add(src, arcname=str(src.relative_to(source_dir)))
         else:
-            # Add the entire repo (minus .git)
+            # Add the entire repo, minus the excluded dirs and files
             for root, dirs, files in os.walk(source_dir):
                 root_path = Path(root)
-                dirs[:] = [d for d in dirs if d != ".git"]
+                dirs[:] = [d for d in dirs if d not in EXCLUDED_DIR_NAMES]
                 for f in files:
                     fp = root_path / f
                     if should_include(fp):
@@ -260,6 +276,3 @@ if __name__ == "__main__":
 
 
 # rm -rf ~/.pm2/logs/*
-
-
-
