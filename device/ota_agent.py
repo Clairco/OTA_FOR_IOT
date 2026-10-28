@@ -51,10 +51,10 @@ PRESERVED_PATHS = frozenset({
 })
 
 # The device .env must exist before an update is applied. The bundle's
-# sample.env lists every key the new code reads; keys missing from the
+# .env.example lists every key the new code reads; keys missing from the
 # device .env are reported in the ack.
 DEVICE_ENV_FILE = ".env"
-SAMPLE_ENV_FILE = "sample.env"
+EXAMPLE_ENV_FILE = ".env.example"
 ENV_COMMENT_PREFIX = "#"
 ENV_EXPORT_PREFIX = "export "
 ENV_KEY_SEPARATOR = "="
@@ -141,16 +141,16 @@ def check_device_env(staging: Path, live: Path) -> list:
 
     Raises RuntimeError when the device has no .env: the bundle's .env is never
     used, so deploying would start the code on defaults (wrong sensor, wrong
-    broker). Returns the keys in the bundle's sample.env that the device .env
-    does not define (empty when the bundle has no sample.env).
+    broker). Returns the keys in the bundle's .env.example that the device .env
+    does not define (empty when the bundle has no .env.example).
     """
     device_env = live / DEVICE_ENV_FILE
     if not device_env.is_file():
         raise RuntimeError(f"device {DEVICE_ENV_FILE} missing in {live}, update not applied")
-    sample_env = staging / SAMPLE_ENV_FILE
-    if not sample_env.is_file():
+    example_env = staging / EXAMPLE_ENV_FILE
+    if not example_env.is_file():
         return []
-    return sorted(read_env_keys(sample_env) - read_env_keys(device_env))
+    return sorted(read_env_keys(example_env) - read_env_keys(device_env))
 
 # ==============================
 # Acknowledgement
@@ -242,7 +242,7 @@ def on_message(client, userdata, msg):
             del sessions[session_id]
             return
         if missing_env_keys:
-            print(f"[warn] Device {DEVICE_ENV_FILE} lacks keys listed in {SAMPLE_ENV_FILE}, "
+            print(f"[warn] Device {DEVICE_ENV_FILE} lacks keys listed in {EXAMPLE_ENV_FILE}, "
                   f"the code defaults will be used: {', '.join(missing_env_keys)}")
 
         # Replace live code
