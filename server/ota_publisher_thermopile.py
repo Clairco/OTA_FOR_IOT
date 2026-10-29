@@ -8,9 +8,12 @@ import time
 import json
 import hashlib
 import uuid
+from fnmatch import fnmatch
 from pathlib import Path
 
 import paho.mqtt.client as paho
+
+from app_env_source import APP_ENV_ARCHIVE_NAME, APP_ENV_SOURCE_PATH, validate_app_env_source
 
 # =========================
 # Configuration
@@ -23,6 +26,21 @@ BRANCHES = ['thermophileTesting']                             # branch to track 
 # What to include in the tar. By default, whole repo (excluding .git).
 # You can restrict to specific subfolders or file patterns if you like.
 INCLUDE_PATHS = []  # e.g., ["src", "scripts", "requirements.txt"]
+
+# Never shipped from the repo folder: device-owned or local-only files. Each
+# device keeps its own app.env, logs and database; this stops the laptop's
+# copies from leaving the laptop. The bundle's app.env comes from
+# APP_ENV_SOURCE_PATH instead (see app_env_source.py).
+# Do not update THERMAL_SENSOR through OTA: each device's sensor is set at
+# device setup, and the bundle's app.env must not contain it.
+EXCLUDED_DIR_NAMES = frozenset({".git", "logs", "__pycache__"})
+EXCLUDED_FILE_PATTERNS = (
+    ".env",
+    "app.env",
+    "*.db", "*.db-wal", "*.db-shm", "*.db-journal",
+    "*.pkl",
+    "*.pyc",
+)
 
 ARCHIVE_BASENAME = "repo_bundle"           # archive base name (timestamp & commit appended)
 OUTPUT_DIR = "C:/Users/HP/Desktop/github/"  # or any writable path                         # None = temp dir; or set a path to keep archives
@@ -63,18 +81,22 @@ def fetch_remote(path: Path):
 def pull_changes(path: Path, remote: str, branch: str):
     run(["git", "pull", remote, branch], cwd=str(path))
 
-def make_tar_gz(source_dir: Path, include_paths, out_dir: Path, base_name: str) -> Path:
+def make_tar_gz(source_dir: Path, include_paths, out_dir: Path, base_name: str, app_env_source: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     archive_name = f"{base_name}-{timestamp}.tar.gz"
     archive_path = out_dir / archive_name
 
     def should_include(p: Path) -> bool:
-        # Exclude .git directory and the output archive itself
-        parts = p.parts
-        if ".git" in parts:
+        # Exclude device-owned/local-only files and the output archive itself.
+        # Check only the path inside the repo, so a parent folder named e.g.
+        # "logs" on the laptop doesn't exclude everything.
+        relative_parts = p.relative_to(source_dir).parts
+        if any(part in EXCLUDED_DIR_NAMES for part in relative_parts[:-1]):
             return False
-        if archive_path.samefile(p) if p.exists() else False:
+        if any(fnmatch(p.name, pattern) for pattern in EXCLUDED_FILE_PATTERNS):
+            return False
+        if archive_path.exists() and p.exists() and archive_path.samefile(p):
             return False
         return True
 
@@ -88,8 +110,8 @@ def make_tar_gz(source_dir: Path, include_paths, out_dir: Path, base_name: str) 
                 if src.is_dir():
                     for root, dirs, files in os.walk(src):
                         root_path = Path(root)
-                        # Filter out .git dirs
-                        dirs[:] = [d for d in dirs if d != ".git"]
+                        # Skip excluded dirs (.git, logs, __pycache__)
+                        dirs[:] = [d for d in dirs if d not in EXCLUDED_DIR_NAMES]
                         for f in files:
                             fp = root_path / f
                             if should_include(fp):
@@ -98,14 +120,16 @@ def make_tar_gz(source_dir: Path, include_paths, out_dir: Path, base_name: str) 
                     if should_include(src):
                         tar.add(src, arcname=str(src.relative_to(source_dir)))
         else:
-            # Add the entire repo (minus .git)
+            # Add the entire repo, minus the excluded dirs and files
             for root, dirs, files in os.walk(source_dir):
                 root_path = Path(root)
-                dirs[:] = [d for d in dirs if d != ".git"]
+                dirs[:] = [d for d in dirs if d not in EXCLUDED_DIR_NAMES]
                 for f in files:
                     fp = root_path / f
                     if should_include(fp):
                         tar.add(fp, arcname=str(fp.relative_to(source_dir)))
+
+        tar.add(app_env_source, arcname=APP_ENV_ARCHIVE_NAME)
 
     return archive_path
 
@@ -224,9 +248,11 @@ def main():
                 # local_head = get_local_head(repo)
                 # print(f"[info] Updated local HEAD: {local_head}")
 
+                app_env_source = validate_app_env_source(APP_ENV_SOURCE_PATH)
+
                 # Always build (you can conditionally build only if changed)
                 out_dir =  Path(tempfile.mkdtemp(prefix="repo_bundle_"))
-                archive_path = make_tar_gz(repo, INCLUDE_PATHS, out_dir, f"{ARCHIVE_BASENAME}-{BRANCH}") # f"{ARCHIVE_BASENAME-{local_head[:7]}")
+                archive_path = make_tar_gz(repo, INCLUDE_PATHS, out_dir, f"{ARCHIVE_BASENAME}-{BRANCH}", app_env_source) # f"{ARCHIVE_BASENAME-{local_head[:7]}")
                 print(f"[info] Archive created: {archive_path} ({archive_path.stat().st_size} bytes)")
 
                 file_hash = sha256_of_file(archive_path)
@@ -260,6 +286,3 @@ if __name__ == "__main__":
 
 
 # rm -rf ~/.pm2/logs/*
-
-
-
