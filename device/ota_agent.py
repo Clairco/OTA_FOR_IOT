@@ -6,16 +6,50 @@ import hashlib
 import platform
 import re
 import subprocess
+import sys
+import threading
 import traceback
 import sqlite3
 from pathlib import Path
 import paho.mqtt.client as paho
-from dotenv import load_dotenv
-load_dotenv()
+from dotenv import dotenv_values
 
 # ==============================
 # Configuration
 # ==============================
+
+# Paths are relative to this file so the agent works from any working directory (pm2, systemd).
+AGENT_DIR = Path(__file__).resolve().parent
+AGENT_ENV_PATH = AGENT_DIR / "agent.env"          # agent-only settings: topic and directories
+APP_ENV_PATH = AGENT_DIR / "prod" / "app.env"     # app settings; the MQTT credentials are shared from here
+
+ENV_KEY_MQTT_PORT = "MQTT_PORT"
+ENV_KEY_MQTT_USERNAME = "MQTT_USERNAME"
+ENV_KEY_MQTT_PASSWORD = "MQTT_PASSWORD"
+ENV_KEY_MQTT_BASE_TOPIC = "MQTT_BASE_TOPIC"
+ENV_KEY_STAGING_DIR = "STAGING_DIR"
+ENV_KEY_PROD_DIR = "PROD_DIR"
+APP_ENV_REQUIRED_KEYS = (ENV_KEY_MQTT_PORT, ENV_KEY_MQTT_USERNAME, ENV_KEY_MQTT_PASSWORD)
+AGENT_ENV_REQUIRED_KEYS = (ENV_KEY_MQTT_BASE_TOPIC, ENV_KEY_STAGING_DIR, ENV_KEY_PROD_DIR)
+
+EXIT_CODE_CONFIG_ERROR = 1
+
+
+def exit_with_config_error(message: str):
+    print(f"[error] {message}", file=sys.stderr)
+    sys.exit(EXIT_CODE_CONFIG_ERROR)
+
+
+def load_required_env(env_path: Path, required_keys) -> dict:
+    """Read a .env file without touching os.environ; exit with an error when the file or a required key is missing."""
+    if not env_path.is_file():
+        exit_with_config_error(f"Env file missing: {env_path}")
+    values = dotenv_values(env_path)
+    missing_keys = [key for key in required_keys if not values.get(key)]
+    if missing_keys:
+        exit_with_config_error(f"Missing keys in {env_path}: {', '.join(missing_keys)}")
+    return values
+
 
 def get_broker_from_db():
     try:
@@ -33,30 +67,33 @@ def get_broker_from_db():
         quit()
 
 
-BROKER = get_broker_from_db()
-PORT = os.getenv("MQTT_PORT")
-USER = os.getenv("MQTT_USERNAME")
-PASSWORD = os.getenv("MQTT_PASSWORD")
-TOPIC = os.getenv("MQTT_BASE_TOPIC")
+APP_ENV = load_required_env(APP_ENV_PATH, APP_ENV_REQUIRED_KEYS)
+AGENT_ENV = load_required_env(AGENT_ENV_PATH, AGENT_ENV_REQUIRED_KEYS)
 
-STAGING_DIR = Path(os.getenv("STAGING_DIR"))          # temp extract location
-LIVE_CODE_DIR = Path(os.getenv("PROD_DIR"))               # your running code location
+BROKER = get_broker_from_db()
+PORT = APP_ENV[ENV_KEY_MQTT_PORT]
+USER = APP_ENV[ENV_KEY_MQTT_USERNAME]
+PASSWORD = APP_ENV[ENV_KEY_MQTT_PASSWORD]
+TOPIC = AGENT_ENV[ENV_KEY_MQTT_BASE_TOPIC]
+
+STAGING_DIR = Path(AGENT_ENV[ENV_KEY_STAGING_DIR])          # temp extract location
+LIVE_CODE_DIR = Path(AGENT_ENV[ENV_KEY_PROD_DIR])           # your running code location
 
 # Device-owned entries at the top level of PROD_DIR. An update never deletes
 # them and never takes them from the bundle, so each device keeps its own
 # configuration and data.
 PRESERVED_PATHS = frozenset({
-    ".env",         # device config: THERMAL_SENSOR, broker, LOG_DIR, ...
-    ".env.bak",     # previous .env, written by an env patch; needed to restore it
+    "app.env",      # device config: THERMAL_SENSOR, MQTT credentials, LOG_DIR, ...
+    "app.env.bak",  # previous app.env, written by an env patch; needed to restore it
     "logs",         # device logs collected for diagnosis
     "iot_data.db",  # local zone/config database, when it lives in PROD_DIR
 })
 
-# The device .env must exist before an update is applied. The bundle's
-# .env.example lists every key the new code reads; keys missing from the
-# device .env are reported in the ack.
-DEVICE_ENV_FILE = ".env"
-EXAMPLE_ENV_FILE = ".env.example"
+# A device without an app.env gets a copy of the bundle's one. A device that has one keeps it and only takes an
+# env_patch.json. The bundle's app.env.example lists every key the new code
+# reads; keys missing from the device app.env are reported in the ack.
+DEVICE_ENV_FILE = "app.env"
+EXAMPLE_ENV_FILE = "app.env.example"
 ENV_COMMENT_PREFIX = "#"
 ENV_EXPORT_PREFIX = "export "
 ENV_KEY_SEPARATOR = "="
@@ -64,8 +101,9 @@ ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # Values containing any of these are written double-quoted.
 ENV_CHARS_NEEDING_QUOTES = frozenset(" \t#\"'\\")
 
-# Optional env_patch.json at the bundle root: edits the device .env, since the
-# .env itself is never shipped. Format:
+# Optional env_patch.json at the bundle root: edits an existing device app.env,
+# since the bundle's app.env never overwrites it. Do not update THERMAL_SENSOR
+# through OTA: each device's sensor is set at device setup. Format:
 #   {
 #     "set_if_missing": {"LOG_DIR": "logs"},     # add new keys, never overwrite
 #     "set":            {"HEARTBEAT_INTERVAL": "300"},  # add or overwrite
@@ -86,6 +124,7 @@ ENV_PATCH_SECTIONS = frozenset({ENV_PATCH_SET_IF_MISSING, ENV_PATCH_SET, ENV_PAT
 ENV_PATCH_STATUS_NONE = "none"
 ENV_PATCH_STATUS_APPLIED = "applied"
 ENV_PATCH_STATUS_NOT_TARGETED = "not_targeted"
+ENV_PATCH_STATUS_SKIPPED_ENV_CREATED = "skipped_env_created"
 ENV_BACKUP_SUFFIX = ".bak"
 ENV_TMP_SUFFIX = ".tmp"
 ENV_FILE_MODE = 0o600
@@ -98,7 +137,11 @@ ACK_QOS = 2
 ACK_STATUS_UPDATED = "updated"
 ACK_STATUS_FAILED = "failed"
 
-#print(BROKER,PORT , USER , PASSWORD ,TOPIC)
+PM2_SERVICES_TO_RESTART = ("scheduler", "app", "MQTT_Control_Consumer")
+PM2_AGENT_SERVICE = "ota"
+# Restarting the agent kills this process, so it waits for the ack to go out first.
+AGENT_RESTART_DELAY_IN_MS = 3000
+MS_PER_SECOND = 1000
 
 sessions = {}
 
@@ -156,7 +199,7 @@ def replace_live_code(staging: Path, live: Path):
         shutil.move(str(item), str(live / item.name))
 
 # ==============================
-# Device .env checks
+# Device app.env checks
 # ==============================
 def parse_env_key(line: str):
     """Return the key defined on a .env line, or None for blank/comment/invalid lines."""
@@ -178,28 +221,37 @@ def read_env_keys(env_path: Path) -> set:
     return keys
 
 
-def require_device_env(live: Path) -> Path:
+def require_app_env_source(staging: Path, live: Path):
     """
-    Return the device .env path; raise RuntimeError when it is missing.
+    Raise RuntimeError when neither the device nor the bundle has an app.env.
 
-    The bundle's .env is never used, so deploying without a device .env would
-    start the code on defaults (wrong sensor, wrong broker).
+    Without either, the new code would start with no app.env (wrong sensor,
+    no credentials), so the update is not applied.
     """
-    device_env = live / DEVICE_ENV_FILE
-    if not device_env.is_file():
-        raise RuntimeError(f"device {DEVICE_ENV_FILE} missing in {live}, update not applied")
-    return device_env
+    if not (live / DEVICE_ENV_FILE).is_file() and not (staging / DEVICE_ENV_FILE).is_file():
+        raise RuntimeError(f"{DEVICE_ENV_FILE} missing on the device ({live}) and in the bundle, update not applied")
+
+
+def write_env_lines_atomically(env_path: Path, lines: list):
+    tmp_path = env_path.with_name(env_path.name + ENV_TMP_SUFFIX)
+    tmp_path.write_text("\n".join(lines) + "\n")
+    os.chmod(tmp_path, ENV_FILE_MODE)
+    os.replace(tmp_path, env_path)
+
+
+def create_app_env_from_bundle(bundle_env: Path, device_env: Path):
+    write_env_lines_atomically(device_env, bundle_env.read_text().splitlines())
 
 
 def find_missing_env_keys(staging: Path, device_env: Path) -> list:
-    """Keys in the bundle's .env.example that the device .env does not define (empty when there is no example)."""
+    """Keys in the bundle's app.env.example that the device app.env does not define (empty when there is no example)."""
     example_env = staging / EXAMPLE_ENV_FILE
     if not example_env.is_file():
         return []
     return sorted(read_env_keys(example_env) - read_env_keys(device_env))
 
 # ==============================
-# Device .env patch (env_patch.json)
+# Device app.env patch (env_patch.json)
 # ==============================
 def _validate_env_mapping(patch: dict, section: str):
     values = patch.get(section, {})
@@ -272,12 +324,12 @@ def format_env_line(key: str, value: str) -> str:
 
 def apply_env_patch(env_path: Path, patch: dict) -> dict:
     """
-    Apply set_if_missing / set / remove to the device .env in place.
+    Apply set_if_missing / set / remove to the device app.env in place.
 
     Comments, order and keys the patch doesn't mention are kept. Every line of
     a key is updated or removed (duplicates included). When something changes,
-    the old file is kept as .env.bak and the new one is written atomically with
-    mode 600. Returns the changed key names only, never values.
+    the old file is kept as app.env.bak and the new one is written atomically
+    with mode 600. Returns the changed key names only, never values.
     """
     lines = env_path.read_text().splitlines()
     key_lines = {}
@@ -316,15 +368,12 @@ def apply_env_patch(env_path: Path, patch: dict) -> dict:
         return changes
 
     shutil.copy2(env_path, env_path.with_name(env_path.name + ENV_BACKUP_SUFFIX))
-    tmp_path = env_path.with_name(env_path.name + ENV_TMP_SUFFIX)
-    tmp_path.write_text("\n".join(line for line in lines if line is not None) + "\n")
-    os.chmod(tmp_path, ENV_FILE_MODE)
-    os.replace(tmp_path, env_path)
+    write_env_lines_atomically(env_path, [line for line in lines if line is not None])
     return {name: sorted(keys) for name, keys in changes.items()}
 
 
 def restore_env_backup(env_path: Path) -> bool:
-    """Put .env.bak back in place after a failed update. Returns True when restored."""
+    """Put app.env.bak back in place after a failed update. Returns True when restored."""
     backup = env_path.with_name(env_path.name + ENV_BACKUP_SUFFIX)
     if not backup.is_file():
         return False
@@ -343,14 +392,34 @@ def publish_ack(client, status: str, **details):
 # ==============================
 def restart_pm2_service():
     try:
-        subprocess.run(["pm2", "restart","scheduler","app","MQTT_Control_Consumer"], check=True)
+        subprocess.run(["pm2", "restart", *PM2_SERVICES_TO_RESTART], check=True)
         print(f"[info] PM2 service  restarted successfully.")
     except subprocess.CalledProcessError as e:
         print(f"[error] Failed to restart PM2 service: {e}")
 
+
+def restart_agent_service():
+    try:
+        subprocess.run(["pm2", "restart", PM2_AGENT_SERVICE], check=True)
+    except (subprocess.CalledProcessError, OSError) as e:
+        print(f"[error] Failed to restart the agent ({PM2_AGENT_SERVICE}): {e}")
+
+
+def schedule_agent_restart():
+    """
+    Restart the agent after a short delay. The ack is published from this same
+    thread's network loop, so waiting for it here would deadlock; the restart
+    runs on a timer instead and kills this process once the ack is out.
+    """
+    threading.Timer(AGENT_RESTART_DELAY_IN_MS / MS_PER_SECOND, restart_agent_service).start()
+    print(f"[info] Agent restart ({PM2_AGENT_SERVICE}) scheduled in {AGENT_RESTART_DELAY_IN_MS} ms.")
+
 # ==============================
 # MQTT callbacks
 # ==============================
+def reset_session(session_id: str):
+    sessions.pop(session_id, None)
+
 def on_connect(client, userdata, flags, rc, properties=None):
     print("[info] Connected with result code", rc)
     client.subscribe(f"{TOPIC}/+/manifest")
@@ -412,27 +481,43 @@ def on_message(client, userdata, msg):
             safe_extract(tar, STAGING_DIR)
         print(f"[info] Extracted into staging: {STAGING_DIR}")
 
-        # Check the device .env and the bundle's env patch before touching anything
+        # Check that an app.env will exist and that the bundle's env patch is valid before touching anything
+        device_env = LIVE_CODE_DIR / DEVICE_ENV_FILE
         try:
-            device_env = require_device_env(LIVE_CODE_DIR)
+            require_app_env_source(STAGING_DIR, LIVE_CODE_DIR)
             env_patch = load_env_patch(STAGING_DIR)
         except (RuntimeError, ValueError) as e:
             print(f"[error] {e}. The current code keeps running.")
             publish_ack(client, ACK_STATUS_FAILED, reason=str(e))
-            del sessions[session_id]
+            reset_session(session_id)
             return
 
-        # Apply the env patch (key names only are logged and acked - values may be secrets)
+        # A device without an app.env gets a copy of the bundle's; a device with one keeps it
+        # and takes the env patch (key names only are logged and acked - values may be secrets)
+        app_env_created = not device_env.is_file()
         env_patch_status = ENV_PATCH_STATUS_NONE
         env_changes = None
-        if env_patch is not None:
+        if app_env_created:
+            try:
+                LIVE_CODE_DIR.mkdir(parents=True, exist_ok=True)
+                create_app_env_from_bundle(STAGING_DIR / DEVICE_ENV_FILE, device_env)
+            except OSError as e:
+                print(f"[error] Could not create {DEVICE_ENV_FILE}: {e}. The current code keeps running.")
+                publish_ack(client, ACK_STATUS_FAILED, reason=f"{DEVICE_ENV_FILE} not created: {e}")
+                reset_session(session_id)
+                return
+            print(f"[info] {DEVICE_ENV_FILE} created from the bundle")
+            if env_patch is not None:
+                env_patch_status = ENV_PATCH_STATUS_SKIPPED_ENV_CREATED
+                print(f"[info] {ENV_PATCH_FILE} skipped, {DEVICE_ENV_FILE} was just created")
+        elif env_patch is not None:
             if is_env_patch_targeted(env_patch, MAC_ADDRESS):
                 try:
                     env_changes = apply_env_patch(device_env, env_patch)
                 except OSError as e:
                     print(f"[error] Could not apply {ENV_PATCH_FILE}: {e}. The current code keeps running.")
                     publish_ack(client, ACK_STATUS_FAILED, reason=f"{ENV_PATCH_FILE} not applied: {e}")
-                    del sessions[session_id]
+                    reset_session(session_id)
                     return
                 env_patch_status = ENV_PATCH_STATUS_APPLIED
                 print(f"[info] {ENV_PATCH_FILE} applied to {DEVICE_ENV_FILE}: "
@@ -446,24 +531,27 @@ def on_message(client, userdata, msg):
             print(f"[warn] Device {DEVICE_ENV_FILE} lacks keys listed in {EXAMPLE_ENV_FILE}, "
                   f"the code defaults will be used: {', '.join(missing_env_keys)}")
 
-        # Replace live code; put the old .env back if that fails
+        # Replace live code; put the old app.env back (or remove the new one) if that fails
         try:
             replace_live_code(STAGING_DIR, LIVE_CODE_DIR)
         except Exception as e:
+            if app_env_created:
+                device_env.unlink(missing_ok=True)
             env_restored = bool(env_changes and any(env_changes.values())) and restore_env_backup(device_env)
             print(f"[error] Replacing the live code failed: {e}"
                   f"{f' ({DEVICE_ENV_FILE} restored from backup)' if env_restored else ''}")
             publish_ack(client, ACK_STATUS_FAILED, reason=f"replace failed: {e}", env_restored=env_restored)
-            del sessions[session_id]
+            reset_session(session_id)
             return
 
         publish_ack(client, ACK_STATUS_UPDATED, missing_env_keys=missing_env_keys,
-                    env_patch=env_patch_status, env_changes=env_changes)
+                    env_patch=env_patch_status, env_changes=env_changes,
+                    app_env_created=app_env_created)
 
-        # Cleanup session
-        del sessions[session_id]
+        reset_session(session_id)
 
         restart_pm2_service()
+        schedule_agent_restart()
 # ===========================
 # Subscription callbacks
 # ===========================
