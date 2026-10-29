@@ -13,6 +13,8 @@ from pathlib import Path
 
 import paho.mqtt.client as paho
 
+from app_env_source import APP_ENV_ARCHIVE_NAME, APP_ENV_SOURCE_PATH, validate_app_env_source
+
 # =========================
 # Configuration
 # =========================
@@ -25,12 +27,16 @@ BRANCHES = ['pcsTesting']                             # branch to track (e.g., m
 # You can restrict to specific subfolders or file patterns if you like.
 INCLUDE_PATHS = []  # e.g., ["src", "scripts", "requirements.txt"]
 
-# Never shipped: device-owned or local-only files. Each device keeps its own
-# .env, logs and database; the OTA agent also refuses to take these from a
-# bundle, this just stops the laptop's copies from leaving the laptop.
+# Never shipped from the repo folder: device-owned or local-only files. Each
+# device keeps its own app.env, logs and database; this stops the laptop's
+# copies from leaving the laptop. The bundle's app.env comes from
+# APP_ENV_SOURCE_PATH instead (see app_env_source.py).
+# Do not update THERMAL_SENSOR through OTA: each device's sensor is set at
+# device setup, and the bundle's app.env must not contain it.
 EXCLUDED_DIR_NAMES = frozenset({".git", "logs", "__pycache__"})
 EXCLUDED_FILE_PATTERNS = (
     ".env",
+    "app.env",
     "*.db", "*.db-wal", "*.db-shm", "*.db-journal",
     "*.pkl",
     "*.pyc",
@@ -75,7 +81,7 @@ def fetch_remote(path: Path):
 def pull_changes(path: Path, remote: str, branch: str):
     run(["git", "pull", remote, branch], cwd=str(path))
 
-def make_tar_gz(source_dir: Path, include_paths, out_dir: Path, base_name: str) -> Path:
+def make_tar_gz(source_dir: Path, include_paths, out_dir: Path, base_name: str, app_env_source: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     archive_name = f"{base_name}-{timestamp}.tar.gz"
@@ -122,6 +128,8 @@ def make_tar_gz(source_dir: Path, include_paths, out_dir: Path, base_name: str) 
                     fp = root_path / f
                     if should_include(fp):
                         tar.add(fp, arcname=str(fp.relative_to(source_dir)))
+
+        tar.add(app_env_source, arcname=APP_ENV_ARCHIVE_NAME)
 
     return archive_path
 
@@ -238,9 +246,11 @@ def main():
                 # local_head = get_local_head(repo)
                 # print(f"[info] Updated local HEAD: {local_head}")
 
+                app_env_source = validate_app_env_source(APP_ENV_SOURCE_PATH)
+
                 # Always build (you can conditionally build only if changed)
                 out_dir = Path(OUTPUT_DIR) if OUTPUT_DIR else Path(tempfile.mkdtemp(prefix="repo_bundle_"))
-                archive_path = make_tar_gz(repo, INCLUDE_PATHS, out_dir, f"{ARCHIVE_BASENAME}-{BRANCH}") # f"{ARCHIVE_BASENAME-{local_head[:7]}")
+                archive_path = make_tar_gz(repo, INCLUDE_PATHS, out_dir, f"{ARCHIVE_BASENAME}-{BRANCH}", app_env_source) # f"{ARCHIVE_BASENAME-{local_head[:7]}")
                 print(f"[info] Archive created: {archive_path} ({archive_path.stat().st_size} bytes)")
 
                 file_hash = sha256_of_file(archive_path)
