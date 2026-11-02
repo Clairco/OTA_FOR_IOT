@@ -72,7 +72,6 @@ EXCLUDED_FILE_PATTERNS = (
 )
 
 ARCHIVE_BASENAME = _ENV.get("ARCHIVE_BASENAME") or "repo_bundle"
-OUTPUT_DIR = _ENV.get("OUTPUT_DIR") or None  # None = temp dir; or set a path to keep archives
 
 MQTT_BROKER = _ENV["MQTT_BROKER"]
 MQTT_PORT = int(_ENV["MQTT_PORT"])
