@@ -12,16 +12,48 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 import paho.mqtt.client as paho
+from dotenv import dotenv_values
 
 from app_env_source import APP_ENV_ARCHIVE_NAME, APP_ENV_SOURCE_PATH, validate_app_env_source
 
 # =========================
+# Env loader
+# =========================
+PUBLISHER_ENV_PATH = Path(__file__).resolve().parent / "publisher.env"
+
+REQUIRED_ENV_KEYS = (
+    "REPO_PATHS", "BRANCH",
+    "MQTT_BROKER", "MQTT_PORT", "MQTT_USERNAME", "MQTT_PASSWORD", "MQTT_BASE_TOPIC",
+)
+
+
+def _load_publisher_env(env_path: Path) -> dict:
+    if not env_path.is_file():
+        print(f"[error] Env file missing: {env_path}", file=sys.stderr)
+        sys.exit(1)
+    values = dotenv_values(env_path)
+    missing = [key for key in REQUIRED_ENV_KEYS if not values.get(key)]
+    if missing:
+        print(f"[error] Missing keys in {env_path}: {', '.join(missing)}", file=sys.stderr)
+        sys.exit(1)
+    return values
+
+
+def _env_bool(values: dict, key: str, default: bool) -> bool:
+    raw = values.get(key)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+_ENV = _load_publisher_env(PUBLISHER_ENV_PATH)
+
+# =========================
 # Configuration
 # =========================
-# "C:\Users\HP\Downloads\AZ Chennai 11June\AZ Chennai\Desk\prod"
-REPO_PATHS = ['C:/Users/HP/Downloads/AZ Chennai 11June/AZ Chennai/Desk/prod']          # local git repo path
+REPO_PATHS = [p.strip() for p in _ENV["REPO_PATHS"].split(",") if p.strip()]  # local git repo path(s)
 REMOTE = "origin"                           # typically 'origin'
-BRANCHES = ['thermophileTesting']                             # branch to track (e.g., main/master/dev)
+BRANCHES = [_ENV["BRANCH"]]                             # branch to track (e.g., main/master/dev)
 
 # What to include in the tar. By default, whole repo (excluding .git).
 # You can restrict to specific subfolders or file patterns if you like.
@@ -42,19 +74,19 @@ EXCLUDED_FILE_PATTERNS = (
     "*.pyc",
 )
 
-ARCHIVE_BASENAME = "repo_bundle"           # archive base name (timestamp & commit appended)
-OUTPUT_DIR = "C:/Users/HP/Desktop/github/"  # or any writable path                         # None = temp dir; or set a path to keep archives
+ARCHIVE_BASENAME = _ENV.get("ARCHIVE_BASENAME") or "repo_bundle"           # archive base name (timestamp & commit appended)
+OUTPUT_DIR = _ENV.get("OUTPUT_DIR") or None  # or any writable path; None = temp dir; or set a path to keep archives
  # base topic — we'll publish manifest + chunks under this
-MQTT_BROKER="172.28.26.11"
-MQTT_PORT=8883
-MQTT_USERNAME='AZCHE_MQTT'
-MQTT_PASSWORD='AstraZeneca@4Ct'
-MQTT_BASE_TOPIC="ota/updates"
+MQTT_BROKER = _ENV["MQTT_BROKER"]
+MQTT_PORT = int(_ENV["MQTT_PORT"])
+MQTT_USERNAME = _ENV["MQTT_USERNAME"]
+MQTT_PASSWORD = _ENV["MQTT_PASSWORD"]
+MQTT_BASE_TOPIC = _ENV["MQTT_BASE_TOPIC"]
 
 # Chunking (many brokers default-limit payloads; 256–512 KB is usually safe)
-CHUNK_SIZE = 256 * 1024  # 256 KB
-QOS = 1                  # 0, 1 or 2; use 1 for at-least-once
-RETAIN_MANIFEST = False  # typically False for updates
+CHUNK_SIZE = int(_ENV.get("CHUNK_SIZE") or 256 * 1024)  # 256 KB
+QOS = int(_ENV.get("QOS") or 1)                  # 0, 1 or 2; use 1 for at-least-once
+RETAIN_MANIFEST = _env_bool(_ENV, "RETAIN_MANIFEST", False)  # typically False for updates
 
 # =========================
 # Helpers
@@ -235,7 +267,7 @@ def main():
             # local_head = get_local_head(repo)
             # thermophile thermopile THERMOPILECHE2
 
-            BRANCH = 'thermopile'
+            BRANCH = _ENV["BRANCH"]
             # remote_head = get_remote_head(repo, REMOTE, BRANCH)
             # print(f"[info] local HEAD : {local_head}")
             # print(f"[info] remote HEAD: {remote_head}")
