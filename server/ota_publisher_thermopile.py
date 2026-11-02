@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
 import sys
-import subprocess
 import tarfile
 import tempfile
 import time
@@ -12,16 +11,46 @@ from fnmatch import fnmatch
 from pathlib import Path
 
 import paho.mqtt.client as paho
+from dotenv import dotenv_values
 
 from app_env_source import APP_ENV_ARCHIVE_NAME, APP_ENV_SOURCE_PATH, validate_app_env_source
 
 # =========================
+# Env loader
+# =========================
+PUBLISHER_ENV_PATH = Path(__file__).resolve().parent / "publisher.env"
+
+REQUIRED_ENV_KEYS = (
+    "REPO_PATHS", "DEVICE_GROUP",
+    "MQTT_BROKER", "MQTT_PORT", "MQTT_USERNAME", "MQTT_PASSWORD", "MQTT_BASE_TOPIC",
+)
+
+
+def _load_publisher_env(env_path: Path) -> dict:
+    if not env_path.is_file():
+        print(f"[error] Env file missing: {env_path}", file=sys.stderr)
+        sys.exit(1)
+    values = dotenv_values(env_path)
+    missing = [key for key in REQUIRED_ENV_KEYS if not values.get(key)]
+    if missing:
+        print(f"[error] Missing keys in {env_path}: {', '.join(missing)}", file=sys.stderr)
+        sys.exit(1)
+    return values
+
+
+def _env_bool(values: dict, key: str, default: bool) -> bool:
+    raw = values.get(key)
+    if raw is None or raw == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+_ENV = _load_publisher_env(PUBLISHER_ENV_PATH)
+
+# =========================
 # Configuration
 # =========================
-# "C:\Users\HP\Downloads\AZ Chennai 11June\AZ Chennai\Desk\prod"
-REPO_PATHS = ['C:/Users/HP/Downloads/AZ Chennai 11June/AZ Chennai/Desk/prod']          # local git repo path
-REMOTE = "origin"                           # typically 'origin'
-BRANCHES = ['thermophileTesting']                             # branch to track (e.g., main/master/dev)
+REPO_PATHS = [p.strip() for p in _ENV["REPO_PATHS"].split(",") if p.strip()]  # local repo path(s)
 
 # What to include in the tar. By default, whole repo (excluding .git).
 # You can restrict to specific subfolders or file patterns if you like.
@@ -42,45 +71,22 @@ EXCLUDED_FILE_PATTERNS = (
     "*.pyc",
 )
 
-ARCHIVE_BASENAME = "repo_bundle"           # archive base name (timestamp & commit appended)
-OUTPUT_DIR = "C:/Users/HP/Desktop/github/"  # or any writable path                         # None = temp dir; or set a path to keep archives
- # base topic — we'll publish manifest + chunks under this
-MQTT_BROKER="172.28.26.11"
-MQTT_PORT=8883
-MQTT_USERNAME='AZCHE_MQTT'
-MQTT_PASSWORD='AstraZeneca@4Ct'
-MQTT_BASE_TOPIC="ota/updates"
+ARCHIVE_BASENAME = _ENV.get("ARCHIVE_BASENAME") or "repo_bundle"
+
+MQTT_BROKER = _ENV["MQTT_BROKER"]
+MQTT_PORT = int(_ENV["MQTT_PORT"])
+MQTT_USERNAME = _ENV["MQTT_USERNAME"]
+MQTT_PASSWORD = _ENV["MQTT_PASSWORD"]
+MQTT_BASE_TOPIC = _ENV["MQTT_BASE_TOPIC"]
 
 # Chunking (many brokers default-limit payloads; 256–512 KB is usually safe)
-CHUNK_SIZE = 256 * 1024  # 256 KB
-QOS = 1                  # 0, 1 or 2; use 1 for at-least-once
-RETAIN_MANIFEST = False  # typically False for updates
+CHUNK_SIZE = int(_ENV.get("CHUNK_SIZE") or 256 * 1024)  # 256 KB
+QOS = int(_ENV.get("QOS") or 1)                  # 0, 1 or 2; use 1 for at-least-once
+RETAIN_MANIFEST = _env_bool(_ENV, "RETAIN_MANIFEST", False)  # typically False for updates
 
 # =========================
 # Helpers
 # =========================
-def run(cmd, cwd=None) -> str:
-    """Run a shell command and return stdout (str). Raises on non-zero exit."""
-    proc = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, shell=False)
-    if proc.returncode != 0:
-        raise RuntimeError(f"Command failed: {' '.join(cmd)}\nSTDERR:\n{proc.stderr}")
-    return proc.stdout.strip()
-
-def is_git_repo(path: Path) -> bool:
-    return (path / ".git").exists()
-
-def get_local_head(path: Path) -> str:
-    return run(["git", "rev-parse", "HEAD"], cwd=str(path))
-
-def get_remote_head(path: Path, remote: str, branch: str) -> str:
-    return run(["git", "rev-parse", f"{remote}/{branch}"], cwd=str(path))
-
-def fetch_remote(path: Path):
-    run(["git", "fetch", "--all", "--prune"], cwd=str(path))
-
-def pull_changes(path: Path, remote: str, branch: str):
-    run(["git", "pull", remote, branch], cwd=str(path))
-
 def make_tar_gz(source_dir: Path, include_paths, out_dir: Path, base_name: str, app_env_source: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y%m%d-%H%M%S")
@@ -154,7 +160,7 @@ def send_archive_over_mqtt(archive_path: Path, base_topic: str, broker: str, por
 
         # Synchronous connect/publish is fine for a one-shot script
         client.connect(broker, port, keepalive=60)
-        
+
         client.loop_start()
 
         with archive_path.open("rb") as f:
@@ -215,6 +221,7 @@ def send_archive_over_mqtt(archive_path: Path, base_topic: str, broker: str, por
         }
     except Exception as e:
         print(f"[error] MQTT send failed: {e}", file=sys.stderr)
+
 # =========================
 # Main flow
 # =========================
@@ -225,57 +232,35 @@ def main():
         if not repo.exists():
             print(f"[error] REPO_PATH does not exist: {repo}", file=sys.stderr)
             sys.exit(1)
-        # if not is_git_repo(repo):
-        #     print(f"[error] Not a git repository: {repo}", file=sys.stderr)
-        #     sys.exit(1)
 
         try:
-            print("[info] Fetching remote...")
-            # fetch_remote(repo)
-            # local_head = get_local_head(repo)
-            # thermophile thermopile THERMOPILECHE2
+            DEVICE_GROUP = _ENV["DEVICE_GROUP"]
 
-            BRANCH = 'thermopile'
-            # remote_head = get_remote_head(repo, REMOTE, BRANCH)
-            # print(f"[info] local HEAD : {local_head}")
-            # print(f"[info] remote HEAD: {remote_head}")
+            app_env_source = validate_app_env_source(APP_ENV_SOURCE_PATH)
 
-            changed = 1 #(local_head != remote_head)
-            if changed:
-                print("[info] Changes detected. Pulling...")
-                # pull_changes(repo, REMOTE, BRANCH)
-                # recompute local head after pull
-                # local_head = get_local_head(repo)
-                # print(f"[info] Updated local HEAD: {local_head}")
-
-                app_env_source = validate_app_env_source(APP_ENV_SOURCE_PATH)
-
-                # Always build (you can conditionally build only if changed)
-                out_dir =  Path(tempfile.mkdtemp(prefix="repo_bundle_"))
-                archive_path = make_tar_gz(repo, INCLUDE_PATHS, out_dir, f"{ARCHIVE_BASENAME}-{BRANCH}", app_env_source) # f"{ARCHIVE_BASENAME-{local_head[:7]}")
+            with tempfile.TemporaryDirectory(prefix="repo_bundle_") as tmp:
+                out_dir = Path(tmp)
+                archive_path = make_tar_gz(repo, INCLUDE_PATHS, out_dir, f"{ARCHIVE_BASENAME}-{DEVICE_GROUP}", app_env_source)
                 print(f"[info] Archive created: {archive_path} ({archive_path.stat().st_size} bytes)")
 
                 file_hash = sha256_of_file(archive_path)
                 print(f"[info] SHA256: {file_hash}")
 
-                print(f"[info] Sending over MQTT to {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_BASE_TOPIC}{f'/{BRANCH}'}' ...")
+                print(f"[info] Sending over MQTT to {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_BASE_TOPIC}/{DEVICE_GROUP}' ...")
                 result = send_archive_over_mqtt(
                     archive_path=archive_path,
-                    base_topic=MQTT_BASE_TOPIC+f"/{BRANCH}",
+                    base_topic=MQTT_BASE_TOPIC + f"/{DEVICE_GROUP}",
                     broker=MQTT_BROKER,
                     port=MQTT_PORT,
                     username=MQTT_USERNAME,
                     password=MQTT_PASSWORD,
                     qos=QOS,
                     retain_manifest=RETAIN_MANIFEST,
-                    chunk_size=CHUNK_SIZE
+                    chunk_size=CHUNK_SIZE,
                 )
 
                 print("[info] MQTT send complete.")
                 print(json.dumps(result, indent=2))
-            else:
-                print("[info] No changes. Using current working tree.")
-
 
         except Exception as e:
             print(f"[error] {e}", file=sys.stderr)
@@ -283,6 +268,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-# rm -rf ~/.pm2/logs/*
