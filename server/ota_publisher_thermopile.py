@@ -22,7 +22,7 @@ from app_env_source import APP_ENV_ARCHIVE_NAME, APP_ENV_SOURCE_PATH, validate_a
 PUBLISHER_ENV_PATH = Path(__file__).resolve().parent / "publisher.env"
 
 REQUIRED_ENV_KEYS = (
-    "REPO_PATHS", "BRANCH",
+    "REPO_PATHS", "DEVICE_GROUP",
     "MQTT_BROKER", "MQTT_PORT", "MQTT_USERNAME", "MQTT_PASSWORD", "MQTT_BASE_TOPIC",
 )
 
@@ -53,8 +53,6 @@ _ENV = _load_publisher_env(PUBLISHER_ENV_PATH)
 # =========================
 REPO_PATHS = [p.strip() for p in _ENV["REPO_PATHS"].split(",") if p.strip()]  # local git repo path(s)
 REMOTE = "origin"                           # typically 'origin'
-BRANCHES = [_ENV["BRANCH"]]                             # branch to track (e.g., main/master/dev)
-
 # What to include in the tar. By default, whole repo (excluding .git).
 # You can restrict to specific subfolders or file patterns if you like.
 INCLUDE_PATHS = []  # e.g., ["src", "scripts", "requirements.txt"]
@@ -265,17 +263,16 @@ def main():
             print("[info] Fetching remote...")
             # fetch_remote(repo)
             # local_head = get_local_head(repo)
-            # thermophile thermopile THERMOPILECHE2
 
-            BRANCH = _ENV["BRANCH"]
-            # remote_head = get_remote_head(repo, REMOTE, BRANCH)
+            DEVICE_GROUP = _ENV["DEVICE_GROUP"]
+            # remote_head = get_remote_head(repo, REMOTE, DEVICE_GROUP)
             # print(f"[info] local HEAD : {local_head}")
             # print(f"[info] remote HEAD: {remote_head}")
 
             changed = 1 #(local_head != remote_head)
             if changed:
                 print("[info] Changes detected. Pulling...")
-                # pull_changes(repo, REMOTE, BRANCH)
+                # pull_changes(repo, REMOTE, DEVICE_GROUP)
                 # recompute local head after pull
                 # local_head = get_local_head(repo)
                 # print(f"[info] Updated local HEAD: {local_head}")
@@ -284,16 +281,16 @@ def main():
 
                 # Always build (you can conditionally build only if changed)
                 out_dir =  Path(tempfile.mkdtemp(prefix="repo_bundle_"))
-                archive_path = make_tar_gz(repo, INCLUDE_PATHS, out_dir, f"{ARCHIVE_BASENAME}-{BRANCH}", app_env_source) # f"{ARCHIVE_BASENAME-{local_head[:7]}")
+                archive_path = make_tar_gz(repo, INCLUDE_PATHS, out_dir, f"{ARCHIVE_BASENAME}-{DEVICE_GROUP}", app_env_source) # f"{ARCHIVE_BASENAME-{local_head[:7]}")
                 print(f"[info] Archive created: {archive_path} ({archive_path.stat().st_size} bytes)")
 
                 file_hash = sha256_of_file(archive_path)
                 print(f"[info] SHA256: {file_hash}")
 
-                print(f"[info] Sending over MQTT to {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_BASE_TOPIC}{f'/{BRANCH}'}' ...")
+                print(f"[info] Sending over MQTT to {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_BASE_TOPIC}{f'/{DEVICE_GROUP}'}' ...")
                 result = send_archive_over_mqtt(
                     archive_path=archive_path,
-                    base_topic=MQTT_BASE_TOPIC+f"/{BRANCH}",
+                    base_topic=MQTT_BASE_TOPIC+f"/{DEVICE_GROUP}",
                     broker=MQTT_BROKER,
                     port=MQTT_PORT,
                     username=MQTT_USERNAME,
