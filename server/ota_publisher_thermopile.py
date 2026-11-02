@@ -238,28 +238,29 @@ def main():
 
             app_env_source = validate_app_env_source(APP_ENV_SOURCE_PATH)
 
-            out_dir = Path(tempfile.mkdtemp(prefix="repo_bundle_"))
-            archive_path = make_tar_gz(repo, INCLUDE_PATHS, out_dir, f"{ARCHIVE_BASENAME}-{DEVICE_GROUP}", app_env_source)
-            print(f"[info] Archive created: {archive_path} ({archive_path.stat().st_size} bytes)")
+            with tempfile.TemporaryDirectory(prefix="repo_bundle_") as tmp:
+                out_dir = Path(tmp)
+                archive_path = make_tar_gz(repo, INCLUDE_PATHS, out_dir, f"{ARCHIVE_BASENAME}-{DEVICE_GROUP}", app_env_source)
+                print(f"[info] Archive created: {archive_path} ({archive_path.stat().st_size} bytes)")
 
-            file_hash = sha256_of_file(archive_path)
-            print(f"[info] SHA256: {file_hash}")
+                file_hash = sha256_of_file(archive_path)
+                print(f"[info] SHA256: {file_hash}")
 
-            print(f"[info] Sending over MQTT to {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_BASE_TOPIC}/{DEVICE_GROUP}' ...")
-            result = send_archive_over_mqtt(
-                archive_path=archive_path,
-                base_topic=MQTT_BASE_TOPIC + f"/{DEVICE_GROUP}",
-                broker=MQTT_BROKER,
-                port=MQTT_PORT,
-                username=MQTT_USERNAME,
-                password=MQTT_PASSWORD,
-                qos=QOS,
-                retain_manifest=RETAIN_MANIFEST,
-                chunk_size=CHUNK_SIZE,
-            )
+                print(f"[info] Sending over MQTT to {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_BASE_TOPIC}/{DEVICE_GROUP}' ...")
+                result = send_archive_over_mqtt(
+                    archive_path=archive_path,
+                    base_topic=MQTT_BASE_TOPIC + f"/{DEVICE_GROUP}",
+                    broker=MQTT_BROKER,
+                    port=MQTT_PORT,
+                    username=MQTT_USERNAME,
+                    password=MQTT_PASSWORD,
+                    qos=QOS,
+                    retain_manifest=RETAIN_MANIFEST,
+                    chunk_size=CHUNK_SIZE,
+                )
 
-            print("[info] MQTT send complete.")
-            print(json.dumps(result, indent=2))
+                print("[info] MQTT send complete.")
+                print(json.dumps(result, indent=2))
 
         except Exception as e:
             print(f"[error] {e}", file=sys.stderr)
