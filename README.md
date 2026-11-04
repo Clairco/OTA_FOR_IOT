@@ -13,9 +13,9 @@ server/ota_publisher_*.py ──► ota/updates/<target>/... ──► device/ot
 
 | File                                 | Runs on                                 | What it does                                                                                                                   |
 | ------------------------------------ | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `server/ota_publisher_thermopile.py` | Developer laptop                        | Packs the thermopile code folder into `repo_bundle-thermopile-<timestamp>.tar.gz` and publishes it to `ota/updates/thermopile` |
-| `server/ota_publisher_pcs.py`        | Developer laptop                        | Same, for PCS (`ota/updates/PCSBLRCLX`)                                                                                        |
-| `device/ota_agent.py`                | Each device, pm2 process `ota` (verify) | Receives the bundle, checks its SHA-256, replaces `PROD_DIR`, restarts the pm2 processes                                       |
+| `server/ota_publisher_thermopile.py` | Developer laptop                        | Packs the thermopile code folder into `repo_bundle-thermopile-<timestamp>.tar.gz` and publishes it to `ota/updates/thermopile`. Reads `targets.config.json` and MongoDB to decide which devices in the group this push targets; prompts for confirmation before publishing. |
+| `server/ota_publisher_pcs.py`        | Developer laptop                        | Same, for PCS (`ota/updates/PCSBLRCLX`). Publishes to every device in the group (no target filter).                                                                                        |
+| `device/ota_agent.py`                | Each device, pm2 process `ota` (verify) | Receives the bundle, checks the manifest's target list, verifies SHA-256, replaces `PROD_DIR`, restarts the pm2 processes      |
 
 
 
@@ -40,8 +40,10 @@ server/ota_publisher_*.py ──► ota/updates/<target>/... ──► device/ot
 ## Pushing an update
 
 1. Set `REPO_PATHS` in the publisher to the code folder you want to ship.
-2. Run `python3 server/ota_publisher_thermopile.py` (or the PCS one).
-3. Each device on that topic replies on `OTA/ack` with `{"mac_Id": ..., "status": "updated"}`.
+2. Pick which devices in the group this push goes to by editing `server/targets.config.json` (copy from `targets.config.example.json`). `mode` is `all`, `include`, or `exclude`; `devices` is a list of device names that must match the `name` field on documents in the Mongo collection named by `MONGO_COLLECTION`.
+3. Run `python3 server/ota_publisher_thermopile.py` (or the PCS one). The thermopile publisher queries MongoDB, prints the plan (group size, mode, device list, effective target count), and asks for confirmation before building the archive or opening MQTT. Type `y` or `yes` to proceed.
+4. Each targeted device replies on `OTA/ack` with `{"mac_Id": ..., "status": "updated"}`. Non-targeted devices in the group see the manifest, log that they aren't targeted, and ignore the chunks.
+5. The resolved target list (what the publisher actually sent) is written to `server/targets.resolved.json` as an audit record.
 
 
 

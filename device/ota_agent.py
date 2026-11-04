@@ -137,6 +137,18 @@ ACK_QOS = 2
 ACK_STATUS_UPDATED = "updated"
 ACK_STATUS_FAILED = "failed"
 
+# Manifest 'targets' block: lets the publisher deploy to a subset of the group.
+#   {"mode": "all"}                            -> everyone in the group
+#   {"mode": "include", "mac": ["AA:BB:..."]}  -> only these devices
+#   {"mode": "exclude", "mac": ["AA:BB:..."]}  -> everyone except these
+# A missing 'targets' block means "all" (older publishers).
+MANIFEST_KEY_TARGETS = "targets"
+TARGETS_KEY_MODE = "mode"
+TARGETS_KEY_MAC = "mac"
+TARGETS_MODE_ALL = "all"
+TARGETS_MODE_INCLUDE = "include"
+TARGETS_MODE_EXCLUDE = "exclude"
+
 PM2_SERVICES_TO_RESTART = ("scheduler", "app", "MQTT_Control_Consumer")
 PM2_AGENT_SERVICE = "ota"
 # Restarting the agent kills this process, so it waits for the ack to go out first.
@@ -315,6 +327,30 @@ def is_env_patch_targeted(patch: dict, device_mac: str) -> bool:
     return str(device_mac).lower() in {mac.lower() for mac in macs}
 
 
+def is_session_targeted(targets, device_mac: str) -> bool:
+    """
+    True when the manifest's 'targets' block includes this device.
+
+    An absent block or mode='all' means every device. Unknown modes fail
+    closed, so a malformed manifest never installs on anything.
+    """
+    if not isinstance(targets, dict):
+        return True
+    mode = targets.get(TARGETS_KEY_MODE, TARGETS_MODE_ALL)
+    if mode == TARGETS_MODE_ALL:
+        return True
+    mac_list = targets.get(TARGETS_KEY_MAC, [])
+    if not isinstance(mac_list, list):
+        return False
+    mac_set = {str(mac).lower() for mac in mac_list}
+    device_mac_lower = str(device_mac).lower()
+    if mode == TARGETS_MODE_INCLUDE:
+        return device_mac_lower in mac_set
+    if mode == TARGETS_MODE_EXCLUDE:
+        return device_mac_lower not in mac_set
+    return False
+
+
 def format_env_line(key: str, value: str) -> str:
     if any(char in ENV_CHARS_NEEDING_QUOTES for char in value):
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
@@ -435,6 +471,9 @@ def on_message(client, userdata, msg):
 
     if topic_parts[-1] == "manifest":
         manifest = json.loads(msg.payload.decode())
+        if not is_session_targeted(manifest.get(MANIFEST_KEY_TARGETS), MAC_ADDRESS):
+            print(f"[info] Session {session_id} does not target this device, skipping")
+            return
         sessions[session_id] = {
             "manifest": manifest,
             "chunks": {},
@@ -442,6 +481,8 @@ def on_message(client, userdata, msg):
         print(f"[info] New session {session_id}, expecting {manifest['total_chunks']} chunks")
 
     elif "chunks" in topic_parts and topic_parts[-2] == "data":
+        if session_id not in sessions:
+            return
         index = int(topic_parts[-1])
         sessions[session_id]["chunks"][index] = msg.payload
         print(f"[info] Got chunk {index} for {session_id} ({len(msg.payload)} bytes)")

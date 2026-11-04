@@ -14,15 +14,28 @@ import paho.mqtt.client as paho
 from dotenv import dotenv_values
 
 from app_env_source import APP_ENV_ARCHIVE_NAME, APP_ENV_SOURCE_PATH, validate_app_env_source
+from device_targeting import (
+    TargetingError,
+    build_manifest_targets,
+    confirm_deployment,
+    fetch_group_devices,
+    load_targets_config,
+    resolve_targets,
+    write_resolved_file,
+)
 
 # =========================
 # Env loader
 # =========================
-PUBLISHER_ENV_PATH = Path(__file__).resolve().parent / "publisher.env"
+SERVER_DIR = Path(__file__).resolve().parent
+PUBLISHER_ENV_PATH = SERVER_DIR / "publisher.env"
+TARGETS_CONFIG_PATH = SERVER_DIR / "targets.config.json"
+TARGETS_RESOLVED_PATH = SERVER_DIR / "targets.resolved.json"
 
 REQUIRED_ENV_KEYS = (
     "REPO_PATHS", "DEVICE_GROUP",
     "MQTT_BROKER", "MQTT_PORT", "MQTT_USERNAME", "MQTT_PASSWORD", "MQTT_BASE_TOPIC",
+    "MONGO_URI", "MONGO_DB", "MONGO_COLLECTION",
 )
 
 
@@ -78,6 +91,10 @@ MQTT_PORT = int(_ENV["MQTT_PORT"])
 MQTT_USERNAME = _ENV["MQTT_USERNAME"]
 MQTT_PASSWORD = _ENV["MQTT_PASSWORD"]
 MQTT_BASE_TOPIC = _ENV["MQTT_BASE_TOPIC"]
+
+MONGO_URI = _ENV["MONGO_URI"]
+MONGO_DB = _ENV["MONGO_DB"]
+MONGO_COLLECTION = _ENV["MONGO_COLLECTION"]
 
 # Chunking (many brokers default-limit payloads; 256–512 KB is usually safe)
 CHUNK_SIZE = int(_ENV.get("CHUNK_SIZE") or 256 * 1024)  # 256 KB
@@ -150,7 +167,8 @@ def sha256_of_file(path: Path) -> str:
 # MQTT send utility
 # =========================
 def send_archive_over_mqtt(archive_path: Path, base_topic: str, broker: str, port: int,
-                           username=None, password=None, qos=1, retain_manifest=False, chunk_size=256*1024):
+                           username=None, password=None, qos=1, retain_manifest=False, chunk_size=256*1024,
+                           manifest_targets=None):
     try:
         client = paho.Client(client_id="", userdata=None, protocol=paho.MQTTv5)
         client.tls_set(cert_reqs=paho.ssl.CERT_NONE)  # disable CA check (since you're using self-signed)
@@ -181,7 +199,8 @@ def send_archive_over_mqtt(archive_path: Path, base_topic: str, broker: str, por
             "sha256": file_hash,
             "chunk_size": chunk_size,
             "total_chunks": total_chunks,
-            "created_at": int(time.time())
+            "created_at": int(time.time()),
+            "targets": manifest_targets or {"mode": "all"},
         }
 
         # Publish manifest first
@@ -226,6 +245,32 @@ def send_archive_over_mqtt(archive_path: Path, base_topic: str, broker: str, por
 # Main flow
 # =========================
 def main():
+    DEVICE_GROUP = _ENV["DEVICE_GROUP"]
+
+    # Resolve the target device set and confirm before touching anything else.
+    # If the user declines (or the config is bad), the publisher exits before
+    # the archive is built or MQTT is contacted.
+    try:
+        targets_config = load_targets_config(TARGETS_CONFIG_PATH)
+        group_devices = fetch_group_devices(MONGO_URI, MONGO_DB, MONGO_COLLECTION, DEVICE_GROUP)
+        if not group_devices:
+            print(f"[error] MongoDB has no devices with device_group='{DEVICE_GROUP}'", file=sys.stderr)
+            sys.exit(2)
+        resolved = resolve_targets(targets_config, group_devices)
+    except TargetingError as e:
+        print(f"[error] {e}", file=sys.stderr)
+        sys.exit(2)
+
+    manifest_targets = build_manifest_targets(resolved)
+
+    if not resolved["effective_macs"]:
+        print("[error] Target set is empty, nothing to deploy to.", file=sys.stderr)
+        sys.exit(2)
+
+    if not confirm_deployment(resolved, DEVICE_GROUP, manifest_targets):
+        print("[info] Deployment cancelled.")
+        sys.exit(0)
+
     for i in range(len(REPO_PATHS)):
         REPO_PATH = REPO_PATHS[i]
         repo = Path(REPO_PATH).resolve()
@@ -234,8 +279,6 @@ def main():
             sys.exit(1)
 
         try:
-            DEVICE_GROUP = _ENV["DEVICE_GROUP"]
-
             app_env_source = validate_app_env_source(APP_ENV_SOURCE_PATH)
 
             with tempfile.TemporaryDirectory(prefix="repo_bundle_") as tmp:
@@ -245,6 +288,9 @@ def main():
 
                 file_hash = sha256_of_file(archive_path)
                 print(f"[info] SHA256: {file_hash}")
+
+                write_resolved_file(TARGETS_RESOLVED_PATH, DEVICE_GROUP, resolved, manifest_targets, archive_path.name)
+                print(f"[info] Target audit written to {TARGETS_RESOLVED_PATH}")
 
                 print(f"[info] Sending over MQTT to {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_BASE_TOPIC}/{DEVICE_GROUP}' ...")
                 result = send_archive_over_mqtt(
@@ -257,6 +303,7 @@ def main():
                     qos=QOS,
                     retain_manifest=RETAIN_MANIFEST,
                     chunk_size=CHUNK_SIZE,
+                    manifest_targets=manifest_targets,
                 )
 
                 print("[info] MQTT send complete.")
