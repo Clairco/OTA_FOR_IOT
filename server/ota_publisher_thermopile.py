@@ -223,13 +223,16 @@ def send_archive_over_mqtt(archive_path: Path, base_topic: str, broker: str, por
 # Main flow
 # =========================
 def main():
-    for i in range(len(REPO_PATHS)):
-        REPO_PATH = REPO_PATHS[i]
-        repo = Path(REPO_PATH).resolve()
-        if not repo.exists():
+    # Validate every repo path up front. Otherwise a bad path mid-list would
+    # halt the publish after earlier repos had already gone out.
+    resolved_repos = [Path(p).resolve() for p in REPO_PATHS]
+    missing = [repo for repo in resolved_repos if not repo.exists()]
+    if missing:
+        for repo in missing:
             print(f"[error] REPO_PATH does not exist: {repo}", file=sys.stderr)
-            sys.exit(1)
+        sys.exit(1)
 
+    for repo in resolved_repos:
         try:
             DEVICE_GROUP = _ENV["DEVICE_GROUP"]
 
