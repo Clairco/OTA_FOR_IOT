@@ -465,9 +465,18 @@ def on_connect(client, userdata, flags, rc, properties=None):
 
 def on_message(client, userdata, msg):
     topic_parts = msg.topic.split('/')
-    if len(topic_parts) < 3:
+    # Topic layouts (session_id is a UUID from the publisher):
+    #   <TOPIC>/<session_id>/manifest
+    #   <TOPIC>/<session_id>/complete
+    #   <TOPIC>/<session_id>/chunks/<meta|data>/<index>
+    # Session id is the segment right above the suffix: one back for
+    # manifest/complete, three back for chunks.
+    if topic_parts[-1] in ("manifest", "complete") and len(topic_parts) >= 2:
+        session_id = topic_parts[-2]
+    elif len(topic_parts) >= 4 and topic_parts[-3] == "chunks":
+        session_id = topic_parts[-4]
+    else:
         return
-    session_id = topic_parts[2]
 
     if topic_parts[-1] == "manifest":
         manifest = json.loads(msg.payload.decode())
@@ -497,6 +506,7 @@ def on_message(client, userdata, msg):
 
         if len(sess["chunks"]) != manifest["total_chunks"]:
             print(f"[warn] Missing chunks: {len(sess['chunks'])}/{manifest['total_chunks']}")
+            reset_session(session_id)
             return
 
         file_bytes = b''.join(sess["chunks"][i] for i in range(manifest["total_chunks"]))
@@ -504,6 +514,7 @@ def on_message(client, userdata, msg):
         sha = hashlib.sha256(file_bytes).hexdigest()
         if sha != manifest["sha256"]:
             print("[error] SHA256 mismatch! Aborting deployment.")
+            reset_session(session_id)
             return
         print("[info] SHA256 verified OK.")
 
