@@ -291,9 +291,6 @@ def main():
                 file_hash = sha256_of_file(archive_path)
                 print(f"[info] SHA256: {file_hash}")
 
-                write_resolved_file(TARGETS_RESOLVED_PATH, DEVICE_GROUP, resolved, manifest_targets, archive_path.name)
-                print(f"[info] Target audit written to {TARGETS_RESOLVED_PATH}")
-
                 print(f"[info] Sending over MQTT to {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_BASE_TOPIC}/{DEVICE_GROUP}' ...")
                 result = send_archive_over_mqtt(
                     archive_path=archive_path,
@@ -307,6 +304,11 @@ def main():
                     chunk_size=CHUNK_SIZE,
                     manifest_targets=manifest_targets,
                 )
+
+                # Audit record is written only after the publish succeeds, so
+                # targets.resolved.json always reflects what was actually sent.
+                write_resolved_file(TARGETS_RESOLVED_PATH, DEVICE_GROUP, resolved, manifest_targets, archive_path.name)
+                print(f"[info] Target audit written to {TARGETS_RESOLVED_PATH}")
 
                 print("[info] MQTT send complete.")
                 print(json.dumps(result, indent=2))
