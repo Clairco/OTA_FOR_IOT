@@ -171,16 +171,15 @@ def sha256_of_file(path: Path) -> str:
 def send_archive_over_mqtt(archive_path: Path, base_topic: str, broker: str, port: int,
                            username=None, password=None, qos=1, retain_manifest=False, chunk_size=256*1024,
                            manifest_targets=None):
-    try:
-        client = paho.Client(client_id="", userdata=None, protocol=paho.MQTTv5)
-        client.tls_set(cert_reqs=paho.ssl.CERT_NONE)  # disable CA check (since you're using self-signed)
-        client.tls_insecure_set(True)
-        if username and password:
-            client.username_pw_set(username, password)
+    client = paho.Client(client_id="", userdata=None, protocol=paho.MQTTv5)
+    client.tls_set(cert_reqs=paho.ssl.CERT_NONE)  # disable CA check (since you're using self-signed)
+    client.tls_insecure_set(True)
+    if username and password:
+        client.username_pw_set(username, password)
 
+    try:
         # Synchronous connect/publish is fine for a one-shot script
         client.connect(broker, port, keepalive=60)
-
         client.loop_start()
 
         with archive_path.open("rb") as f:
@@ -230,9 +229,6 @@ def send_archive_over_mqtt(archive_path: Path, base_topic: str, broker: str, por
         info = client.publish(f"{topic_prefix}/complete", json.dumps(complete), qos=qos)
         info.wait_for_publish()
 
-        client.loop_stop()
-        client.disconnect()
-
         return {
             "session_id": session_id,
             "topic_prefix": topic_prefix,
@@ -240,8 +236,9 @@ def send_archive_over_mqtt(archive_path: Path, base_topic: str, broker: str, por
             "total_chunks": total_chunks,
             "size_bytes": total_size,
         }
-    except Exception as e:
-        print(f"[error] MQTT send failed: {e}", file=sys.stderr)
+    finally:
+        client.loop_stop()
+        client.disconnect()
 
 # =========================
 # Main flow
@@ -273,13 +270,16 @@ def main():
         print("[info] Deployment cancelled.")
         sys.exit(0)
 
-    for i in range(len(REPO_PATHS)):
-        REPO_PATH = REPO_PATHS[i]
-        repo = Path(REPO_PATH).resolve()
-        if not repo.exists():
+    # Validate every repo path up front. Otherwise a bad path mid-list would
+    # halt the publish after earlier repos had already gone out.
+    resolved_repos = [Path(p).resolve() for p in REPO_PATHS]
+    missing = [repo for repo in resolved_repos if not repo.exists()]
+    if missing:
+        for repo in missing:
             print(f"[error] REPO_PATH does not exist: {repo}", file=sys.stderr)
-            sys.exit(1)
+        sys.exit(1)
 
+    for repo in resolved_repos:
         try:
             app_env_source = validate_app_env_source(APP_ENV_SOURCE_PATH)
 
