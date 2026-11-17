@@ -18,7 +18,7 @@ from device_targeting import (
     TargetingError,
     build_manifest_targets,
     confirm_deployment,
-    fetch_group_devices,
+    fetch_devices,
     load_targets_config,
     resolve_targets,
     write_resolved_file,
@@ -95,6 +95,8 @@ MQTT_BASE_TOPIC = _ENV["MQTT_BASE_TOPIC"]
 MONGO_URI = _ENV["MONGO_URI"]
 MONGO_DB = _ENV["MONGO_DB"]
 MONGO_COLLECTION = _ENV["MONGO_COLLECTION"]
+MONGO_NAME_FIELD = _ENV.get("MONGO_NAME_FIELD") or "sensorName"
+MONGO_MAC_FIELD = _ENV.get("MONGO_MAC_FIELD") or "macAddress"
 
 # Chunking (many brokers default-limit payloads; 256–512 KB is usually safe)
 CHUNK_SIZE = int(_ENV.get("CHUNK_SIZE") or 256 * 1024)  # 256 KB
@@ -252,11 +254,11 @@ def main():
     # the archive is built or MQTT is contacted.
     try:
         targets_config = load_targets_config(TARGETS_CONFIG_PATH)
-        group_devices = fetch_group_devices(MONGO_URI, MONGO_DB, MONGO_COLLECTION, DEVICE_GROUP)
-        if not group_devices:
-            print(f"[error] MongoDB has no devices with device_group='{DEVICE_GROUP}'", file=sys.stderr)
+        all_devices = fetch_devices(MONGO_URI, MONGO_DB, MONGO_COLLECTION, MONGO_NAME_FIELD, MONGO_MAC_FIELD)
+        if not all_devices:
+            print(f"[error] MongoDB collection '{MONGO_COLLECTION}' has no devices", file=sys.stderr)
             sys.exit(2)
-        resolved = resolve_targets(targets_config, group_devices)
+        resolved = resolve_targets(targets_config, all_devices)
     except TargetingError as e:
         print(f"[error] {e}", file=sys.stderr)
         sys.exit(2)

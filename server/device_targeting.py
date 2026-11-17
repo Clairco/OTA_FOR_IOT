@@ -23,9 +23,8 @@ CONFIG_KEY_DEVICES = "devices"
 MANIFEST_KEY_MODE = "mode"
 MANIFEST_KEY_MAC = "mac"
 
-MONGO_FIELD_NAME = "name"
-MONGO_FIELD_MAC = "mac"
-MONGO_FIELD_GROUP = "device_group"
+MONGO_FIELD_NAME_DEFAULT = "sensorName"
+MONGO_FIELD_MAC_DEFAULT = "macAddress"
 
 MONGO_SERVER_SELECTION_TIMEOUT_MS = 5000
 
@@ -70,8 +69,14 @@ def load_targets_config(path: Path) -> dict:
     return {CONFIG_KEY_MODE: mode, CONFIG_KEY_DEVICES: devices}
 
 
-def fetch_group_devices(mongo_uri: str, db_name: str, collection_name: str, device_group: str) -> list:
-    """Return [{name, mac}, ...] for every device in the given group."""
+def fetch_devices(
+    mongo_uri: str,
+    db_name: str,
+    collection_name: str,
+    name_field: str = MONGO_FIELD_NAME_DEFAULT,
+    mac_field: str = MONGO_FIELD_MAC_DEFAULT,
+) -> list:
+    """Return [{name, mac}, ...] for every device in the collection."""
     try:
         from pymongo import MongoClient
     except ImportError as e:
@@ -82,8 +87,8 @@ def fetch_group_devices(mongo_uri: str, db_name: str, collection_name: str, devi
         client = MongoClient(mongo_uri, serverSelectionTimeoutMS=MONGO_SERVER_SELECTION_TIMEOUT_MS)
         collection = client[db_name][collection_name]
         docs = list(collection.find(
-            {MONGO_FIELD_GROUP: device_group},
-            {MONGO_FIELD_NAME: 1, MONGO_FIELD_MAC: 1, "_id": 0},
+            {},
+            {name_field: 1, mac_field: 1, "_id": 0},
         ))
     except Exception as e:
         raise TargetingError(f"MongoDB query failed: {e}") from e
@@ -95,30 +100,37 @@ def fetch_group_devices(mongo_uri: str, db_name: str, collection_name: str, devi
                 pass
 
     devices = []
+    skipped = 0
     for doc in docs:
-        name = doc.get(MONGO_FIELD_NAME)
-        mac = doc.get(MONGO_FIELD_MAC)
+        name = doc.get(name_field)
+        mac = doc.get(mac_field)
         if not name or not mac:
-            print(f"[warn] skipping malformed Mongo doc (missing name or mac): {doc}", file=sys.stderr)
+            skipped += 1
             continue
         devices.append({"name": name, "mac": str(mac).upper()})
+    if skipped:
+        print(
+            f"[warn] skipped {skipped}/{len(docs)} MongoDB document(s) "
+            f"missing '{name_field}' or '{mac_field}' field",
+            file=sys.stderr,
+        )
     return devices
 
 
-def resolve_targets(config: dict, group_devices: list) -> dict:
+def resolve_targets(config: dict, all_devices: list) -> dict:
     """
     Resolve config names to Mongo devices and compute the effective MAC set.
 
-    Raises TargetingError when a name in the config has no match, or when the
-    group has duplicate names (a data bug we won't paper over).
+    Raises TargetingError when a name in the config has no match, or when
+    MongoDB has duplicate names (a data bug we won't paper over).
     """
     mode = config[CONFIG_KEY_MODE]
 
     by_name = {}
-    for device in group_devices:
+    for device in all_devices:
         if device["name"] in by_name:
             raise TargetingError(
-                f"MongoDB has multiple devices named '{device['name']}' in this group"
+                f"MongoDB has multiple devices named '{device['name']}'"
             )
         by_name[device["name"]] = device
 
@@ -136,23 +148,23 @@ def resolve_targets(config: dict, group_devices: list) -> dict:
             requested.append(match)
     if unknown:
         raise TargetingError(
-            f"these names are not in MongoDB for this group: {', '.join(unknown)}"
+            f"these names are not in MongoDB: {', '.join(unknown)}"
         )
 
-    group_macs = [d["mac"] for d in group_devices]
+    all_macs = [d["mac"] for d in all_devices]
     requested_mac_set = {d["mac"] for d in requested}
 
     if mode == TARGET_MODE_ALL:
-        effective_macs = list(group_macs)
+        effective_macs = list(all_macs)
     elif mode == TARGET_MODE_INCLUDE:
         effective_macs = [d["mac"] for d in requested]
     else:  # exclude
-        effective_macs = [m for m in group_macs if m not in requested_mac_set]
+        effective_macs = [m for m in all_macs if m not in requested_mac_set]
 
     return {
         "config_mode": mode,
-        "group_devices": group_devices,
-        "group_macs": group_macs,
+        "all_devices": all_devices,
+        "all_macs": all_macs,
         "requested_devices": requested,
         "effective_macs": effective_macs,
     }
@@ -165,7 +177,7 @@ def build_manifest_targets(resolved: dict) -> dict:
         return {MANIFEST_KEY_MODE: TARGET_MODE_ALL}
 
     effective_set = set(resolved["effective_macs"])
-    exclude_macs = [m for m in resolved["group_macs"] if m not in effective_set]
+    exclude_macs = [m for m in resolved["all_macs"] if m not in effective_set]
     include_macs = list(resolved["effective_macs"])
 
     if len(include_macs) <= len(exclude_macs):
@@ -176,7 +188,7 @@ def build_manifest_targets(resolved: dict) -> dict:
 def confirm_deployment(resolved: dict, device_group: str, manifest_targets: dict) -> bool:
     """Print a summary and read 'y' / 'yes' from the terminal."""
     mode = resolved["config_mode"]
-    group_size = len(resolved["group_macs"])
+    known_count = len(resolved["all_macs"])
     effective_count = len(resolved["effective_macs"])
     manifest_mode = manifest_targets[MANIFEST_KEY_MODE]
     manifest_list_size = len(manifest_targets.get(MANIFEST_KEY_MAC, []))
@@ -184,7 +196,8 @@ def confirm_deployment(resolved: dict, device_group: str, manifest_targets: dict
     print()
     print("OTA deployment plan")
     print("-" * 60)
-    print(f"  Device group:    {device_group}  ({group_size} device(s) in group)")
+    print(f"  Device group:    {device_group}  (MQTT topic suffix)")
+    print(f"  Known devices:   {known_count} in MongoDB")
     print(f"  Config mode:     {mode}")
     manifest_detail = "" if manifest_mode == TARGET_MODE_ALL else f"  ({manifest_list_size} MAC(s) in list)"
     print(f"  Manifest mode:   {manifest_mode}{manifest_detail}")
@@ -192,7 +205,7 @@ def confirm_deployment(resolved: dict, device_group: str, manifest_targets: dict
     print()
 
     if mode == TARGET_MODE_ALL:
-        print("  Every device in the group is targeted.")
+        print("  Every known device is targeted.")
     else:
         label = "Devices to include" if mode == TARGET_MODE_INCLUDE else "Devices to exclude"
         print(f"  {label} (from config):")
@@ -219,7 +232,7 @@ def write_resolved_file(
         "resolved_at": datetime.now(timezone.utc).isoformat(),
         "device_group": device_group,
         "config_mode": resolved["config_mode"],
-        "group_size": len(resolved["group_macs"]),
+        "known_device_count": len(resolved["all_macs"]),
         "effective_target_count": len(resolved["effective_macs"]),
         "requested_devices": resolved["requested_devices"],
         "effective_macs": resolved["effective_macs"],
