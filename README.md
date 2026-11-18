@@ -13,9 +13,9 @@ server/ota_publisher_*.py ──► ota/updates/<target>/... ──► device/ot
 
 | File                                 | Runs on                                 | What it does                                                                                                                   |
 | ------------------------------------ | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| `server/ota_publisher_thermopile.py` | Developer laptop                        | Packs the thermopile code folder into `repo_bundle-thermopile-<timestamp>.tar.gz` and publishes it to `ota/updates/thermopile` |
-| `server/ota_publisher_pcs.py`        | Developer laptop                        | Same, for PCS (`ota/updates/PCSBLRCLX`)                                                                                        |
-| `device/ota_agent.py`                | Each device, pm2 process `ota` (verify) | Receives the bundle, checks its SHA-256, replaces `PROD_DIR`, restarts the pm2 processes                                       |
+| `server/ota_publisher_thermopile.py` | Developer laptop                        | Packs the thermopile code folder into `repo_bundle-thermopile-<timestamp>.tar.gz` and publishes it to `ota/updates/thermopile`. Reads `targets.config.json` and MongoDB to decide which devices in the group this push targets; prompts for confirmation before publishing. |
+| `server/ota_publisher_pcs.py`        | Developer laptop                        | Same, for PCS (`ota/updates/PCSBLRCLX`). Publishes to every device in the group (no target filter).                                                                                        |
+| `device/ota_agent.py`                | Each device, pm2 process `ota` (verify) | Receives the bundle, checks the manifest's target list, verifies SHA-256, replaces `PROD_DIR`, restarts the pm2 processes      |
 
 
 
@@ -39,9 +39,54 @@ server/ota_publisher_*.py ──► ota/updates/<target>/... ──► device/ot
 
 ## Pushing an update
 
-1. Set `REPO_PATHS` in the publisher to the code folder you want to ship.
-2. Run `python3 server/ota_publisher_thermopile.py` (or the PCS one).
-3. Each device on that topic replies on `OTA/ack` with `{"mac_Id": ..., "status": "updated"}`.
+1. Set `REPO_PATHS` in `server/publisher.env` to the code folder you want to ship.
+2. Pick which devices in the group this push goes to — see [Selective delivery](#selective-delivery-adding-devices-and-picking-a-mode) below.
+3. Run `python3 server/ota_publisher_thermopile.py` (or the PCS one). The thermopile publisher queries MongoDB, prints the plan (group size, mode, device list, effective target count), and asks for confirmation before building the archive or opening MQTT. Type `y` or `yes` to proceed.
+4. Each targeted device replies on `OTA/ack` with `{"mac_Id": ..., "status": "updated"}`. Non-targeted devices in the group see the manifest, log that they aren't targeted, and ignore the chunks.
+5. The resolved target list (what the publisher actually sent) is written to `server/targets.resolved.json` as an audit record.
+
+### Selective delivery: adding devices and picking a mode
+
+The thermopile publisher reads `server/targets.config.json` to decide which devices inside the MQTT group actually install this push. The file is git-ignored; copy `server/targets.config.example.json` the first time.
+
+**File format**
+
+```json
+{
+  "mode": "include",
+  "devices": [
+    "thermopile-lab-01",
+    "thermopile-lab-02"
+  ]
+}
+```
+
+**`mode`** — one of:
+
+| Mode      | Who installs the push                                                                 | `devices` list                |
+| --------- | ------------------------------------------------------------------------------------- | ----------------------------- |
+| `all`     | Every device in the group currently known to MongoDB.                                 | Ignored (can be omitted).     |
+| `include` | Only the devices named in `devices`.                                                  | Required, non-empty.          |
+| `exclude` | Every device in the group *except* the ones named in `devices` (safe way to skip a known-broken unit). | Required, non-empty.          |
+
+**`devices`** — a list of device **names**, not MAC addresses. Each name must match the `name` field (`MONGO_FIELD_NAME_DEFAULT = "sensorName"`) on a document in the Mongo collection pointed at by `MONGO_COLLECTION` in `publisher.env`. The publisher looks up each name, pulls its `macAddress`, and embeds the resulting MAC list (or its complement, whichever is shorter) in the manifest. Unknown names abort the push before anything is sent.
+
+**Adding a new device to a push**
+
+1. Make sure the device is registered in MongoDB with a `sensorName` and `macAddress` (this happens through the device app, not this repo).
+2. Open `server/targets.config.json`.
+3. Set `mode` to `include` (or `exclude`, depending on intent) and add the device's `sensorName` to the `devices` list. For an all-devices push, set `mode` to `"all"`.
+4. Run the publisher. The plan it prints shows:
+   - the group (MQTT topic suffix),
+   - how many devices MongoDB knows about,
+   - the chosen mode,
+   - the full list of devices to include or exclude,
+   - the effective target count.
+   Review it, then type `y` to proceed.
+
+**On the device side**, [ota_agent.py](device/ota_agent.py) checks the manifest's `targets` block in `on_message` ([ota_agent.py:472-476](device/ota_agent.py#L472-L476)): if this MAC is not in the effective set, the agent logs `Session … does not target this device, skipping` and drops the chunks without touching `PROD_DIR`. Unknown modes fail closed, so a malformed manifest never installs anywhere.
+
+> **PCS publisher note:** `ota_publisher_pcs.py` does not currently read `targets.config.json` — every device in the PCS group gets every push.
 
 
 
