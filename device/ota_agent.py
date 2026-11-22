@@ -1,6 +1,8 @@
+import argparse
 import os
 import shutil
 import tarfile
+import time
 import json
 import hashlib
 import platform
@@ -67,17 +69,21 @@ def get_broker_from_db():
         quit()
 
 
-APP_ENV = load_required_env(APP_ENV_PATH, APP_ENV_REQUIRED_KEYS)
-AGENT_ENV = load_required_env(AGENT_ENV_PATH, AGENT_ENV_REQUIRED_KEYS)
+# Env loading and MQTT client setup happen in the __main__ guard at the bottom
+# of this file so a `--selfcheck` subprocess (spawned by the running agent to
+# validate a candidate ota_agent.py) short-circuits before touching the live
+# broker, DB, or envs. The names below are populated there and referenced by
+# the module-level callbacks only once the main loop is running.
+APP_ENV = None
+AGENT_ENV = None
+BROKER = None
+PORT = None
+USER = None
+PASSWORD = None
+TOPIC = None
 
-BROKER = get_broker_from_db()
-PORT = APP_ENV[ENV_KEY_MQTT_PORT]
-USER = APP_ENV[ENV_KEY_MQTT_USERNAME]
-PASSWORD = APP_ENV[ENV_KEY_MQTT_PASSWORD]
-TOPIC = AGENT_ENV[ENV_KEY_MQTT_BASE_TOPIC]
-
-STAGING_DIR = Path(AGENT_ENV[ENV_KEY_STAGING_DIR])          # temp extract location
-LIVE_CODE_DIR = Path(AGENT_ENV[ENV_KEY_PROD_DIR])           # your running code location
+STAGING_DIR = None          # temp extract location for normal OTA
+LIVE_CODE_DIR = None        # live code directory on the device
 
 # Device-owned entries at the top level of PROD_DIR. An update never deletes
 # them and never takes them from the bundle, so each device keeps its own
@@ -137,6 +143,25 @@ ACK_QOS = 2
 ACK_STATUS_UPDATED = "updated"
 ACK_STATUS_FAILED = "failed"
 
+# Ack payload discriminator so the server can tell the two pipelines apart.
+ACK_KEY_MODULE = "module"
+ACK_MODULE_APP = "app"               # normal OTA that replaces LIVE_CODE_DIR
+ACK_MODULE_AGENT = "ota_agent"       # agent self-update pipeline
+# Which step of the agent-OTA flow failed. Sent only on failures so the server
+# can group failures by cause.
+ACK_KEY_STAGE = "stage"
+ACK_KEY_REASON = "reason"
+ACK_STAGE_SHA = "sha_mismatch"
+ACK_STAGE_EXTRACT = "extract"
+ACK_STAGE_BUNDLE_SHAPE = "bundle_shape"
+ACK_STAGE_ENV_VALIDATION = "env_validation"
+ACK_STAGE_PROD_DIR_CHECK = "prod_dir_check"
+ACK_STAGE_SELFCHECK = "selfcheck"
+ACK_STAGE_REPLACE = "replace"
+ACK_STAGE_PM2_REACHABLE = "pm2_reachable"
+ACK_STAGE_PM2_RESTART = "pm2_restart"
+ACK_STAGE_CONCURRENCY = "concurrency"
+
 # Manifest 'targets' block: lets the publisher deploy to a subset of the group.
 #   {"mode": "all"}                            -> everyone in the group
 #   {"mode": "include", "mac": ["AA:BB:..."]}  -> only these devices
@@ -154,6 +179,58 @@ PM2_AGENT_SERVICE = "ota"
 # Restarting the agent kills this process, so it waits for the ack to go out first.
 AGENT_RESTART_DELAY_IN_MS = 3000
 MS_PER_SECOND = 1000
+
+# ==============================
+# Agent self-update pipeline
+# ==============================
+# A separate MQTT topic tree carries updates to the agent itself (ota_agent.py
+# and/or agent.env). Keeping it off the normal OTA topic means a routine
+# app-code publish cannot accidentally touch the agent, and vice versa.
+AGENT_OTA_TOPIC = "OTA_AGENT"
+AGENT_OTA_STAGING_DIR = AGENT_DIR / "agent_staging"
+
+# Session kinds — one entry per active session marks which pipeline it belongs
+# to, so the concurrency guard can reject an agent-OTA manifest whenever any
+# other session is already in flight (per spec: a collision means an accident).
+SESSION_KIND_KEY = "kind"
+SESSION_KIND_APP = "app"
+SESSION_KIND_AGENT = "agent"
+
+# Bundle contents for an agent OTA. Everything is optional, but at least one
+# must be present; agent.env and agent_env_patch.json are mutually exclusive
+# (one describes a full file, the other a diff — applying both is ambiguous).
+AGENT_BUNDLE_SCRIPT = "ota_agent.py"
+AGENT_BUNDLE_ENV = "agent.env"
+AGENT_BUNDLE_ENV_PATCH = "agent_env_patch.json"
+
+AGENT_SCRIPT_PATH = AGENT_DIR / AGENT_BUNDLE_SCRIPT
+AGENT_SCRIPT_BAK = AGENT_SCRIPT_PATH.with_name(AGENT_BUNDLE_SCRIPT + ENV_BACKUP_SUFFIX)
+AGENT_ENV_BAK = AGENT_ENV_PATH.with_name(AGENT_ENV_PATH.name + ENV_BACKUP_SUFFIX)
+
+# Selfcheck: spawn the candidate ota_agent.py with --selfcheck so it validates
+# imports, both env files, and MQTT connectivity before we commit the swap. A
+# distinct client_id suffix avoids kicking the running agent off the broker
+# via MQTT 5 take-over semantics.
+SELFCHECK_FLAG = "--selfcheck"
+SELFCHECK_AGENT_ENV_FLAG = "--selfcheck-agent-env"
+SELFCHECK_APP_ENV_FLAG = "--selfcheck-app-env"
+SELFCHECK_CLIENT_ID_SUFFIX = "_selfcheck"
+SELFCHECK_TIMEOUT_SECS = 15
+SELFCHECK_CONNECT_TIMEOUT_SECS = 10
+SELFCHECK_STDERR_MAX_CHARS = 300  # bounds what we put into the failure reason
+
+# Non-zero exit codes from the selfcheck subprocess. The parent maps these to
+# reason strings in the ack so the server sees which check failed.
+SELFCHECK_EXIT_OK = 0
+SELFCHECK_EXIT_AGENT_ENV_MISSING = 10
+SELFCHECK_EXIT_AGENT_ENV_INVALID = 11
+SELFCHECK_EXIT_APP_ENV_MISSING = 20
+SELFCHECK_EXIT_APP_ENV_INVALID = 21
+SELFCHECK_EXIT_BROKER_LOOKUP = 30
+SELFCHECK_EXIT_MQTT_CONNECT = 31
+SELFCHECK_EXIT_MQTT_ERROR = 32
+SELFCHECK_EXIT_SPAWN_TIMEOUT = 97
+SELFCHECK_EXIT_SPAWN_ERROR = 98
 
 sessions = {}
 
@@ -450,6 +527,459 @@ def schedule_agent_restart():
     threading.Timer(AGENT_RESTART_DELAY_IN_MS / MS_PER_SECOND, restart_agent_service).start()
     print(f"[info] Agent restart ({PM2_AGENT_SERVICE}) scheduled in {AGENT_RESTART_DELAY_IN_MS} ms.")
 
+
+def check_pm2_service_reachable(service: str):
+    """
+    Return (ok, detail). True when `pm2 describe <service>` exits 0, meaning
+    the pm2 daemon is up and knows about this service. Done before we commit
+    the swap so we never leave the device with new files and no way to run.
+    """
+    try:
+        result = subprocess.run(
+            ["pm2", "describe", service],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return False, f"pm2 describe exit {result.returncode}"
+        return True, ""
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, f"pm2 describe failed: {type(e).__name__}"
+
+
+def schedule_agent_restart_with_failure_ack(client):
+    """
+    Agent-OTA variant of the restart: on failure (pm2 call returns non-zero or
+    raises), emit a correction ack with stage=pm2_restart. The ack can go out
+    because a failed pm2 restart leaves this process alive.
+    """
+    def restart():
+        try:
+            subprocess.run(["pm2", "restart", PM2_AGENT_SERVICE], check=True, timeout=30)
+        except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired) as e:
+            print(f"[error] pm2 restart failed after successful swap: {e}")
+            publish_ack(
+                client, ACK_STATUS_FAILED,
+                **{
+                    ACK_KEY_MODULE: ACK_MODULE_AGENT,
+                    ACK_KEY_STAGE: ACK_STAGE_PM2_RESTART,
+                    ACK_KEY_REASON: f"pm2 restart failed: {type(e).__name__}",
+                },
+            )
+    threading.Timer(AGENT_RESTART_DELAY_IN_MS / MS_PER_SECOND, restart).start()
+    print(f"[info] Agent restart ({PM2_AGENT_SERVICE}) scheduled in {AGENT_RESTART_DELAY_IN_MS} ms.")
+
+
+# ==============================
+# Agent OTA pipeline
+# ==============================
+def publish_agent_ack_failed(client, stage: str, reason: str, **extras):
+    """Agent-OTA failure ack: stage and reason are mandatory, module is fixed."""
+    publish_ack(
+        client, ACK_STATUS_FAILED,
+        **{ACK_KEY_MODULE: ACK_MODULE_AGENT, ACK_KEY_STAGE: stage, ACK_KEY_REASON: reason},
+        **extras,
+    )
+
+
+def prune_agent_backups():
+    """
+    Remove any .bak files left by previous agent-OTAs. Called at the start of
+    every new agent-OTA so the backups on disk always reflect the state
+    immediately before the most recent update, not some older ancestor.
+    """
+    for bak in (AGENT_SCRIPT_BAK, AGENT_ENV_BAK):
+        if bak.is_file():
+            try:
+                bak.unlink()
+                print(f"[info] Removed stale backup {bak.name}")
+            except OSError as e:
+                print(f"[warn] Could not remove stale backup {bak}: {e}")
+
+
+def load_agent_env_patch(patch_path: Path):
+    """
+    Load and validate the bundle's agent_env_patch.json, reusing the same
+    shape rules as the app-env patch. Raises ValueError on any violation so a
+    bad patch aborts before anything on disk is touched.
+    """
+    try:
+        patch = json.loads(patch_path.read_text())
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{AGENT_BUNDLE_ENV_PATCH} is not valid JSON: {e}") from e
+    if not isinstance(patch, dict):
+        raise ValueError(f"{AGENT_BUNDLE_ENV_PATCH} must be a JSON object")
+    patch = {key: value for key, value in patch.items() if not str(key).startswith(ENV_PATCH_NOTE_PREFIX)}
+    unknown = set(patch) - ENV_PATCH_SECTIONS
+    if unknown:
+        raise ValueError(f"{AGENT_BUNDLE_ENV_PATCH}: unknown sections {sorted(unknown)}")
+    _validate_env_mapping(patch, ENV_PATCH_SET_IF_MISSING)
+    _validate_env_mapping(patch, ENV_PATCH_SET)
+    removed = patch.get(ENV_PATCH_REMOVE, [])
+    if not isinstance(removed, list) or not all(isinstance(k, str) and ENV_KEY_PATTERN.match(k) for k in removed):
+        raise ValueError(f"{AGENT_BUNDLE_ENV_PATCH}: '{ENV_PATCH_REMOVE}' must be a list of key names")
+    written = set(patch.get(ENV_PATCH_SET, {})) | set(patch.get(ENV_PATCH_SET_IF_MISSING, {}))
+    conflicts = written & set(removed)
+    if conflicts:
+        raise ValueError(f"{AGENT_BUNDLE_ENV_PATCH}: keys both set and removed: {sorted(conflicts)}")
+    return patch
+
+
+def materialise_effective_agent_env(staging: Path, new_env: Path, env_patch, has_env: bool):
+    """
+    Produce the agent.env the new ota_agent.py would see on next boot so the
+    selfcheck subprocess can validate it. Full replacement -> copy the
+    bundle's. Patch -> apply the patch to a shadow of the current file. No
+    change -> a copy of the current file.
+    """
+    effective = staging / "agent.env.effective"
+    if has_env:
+        shutil.copyfile(new_env, effective)
+    else:
+        shutil.copyfile(AGENT_ENV_PATH, effective)
+        if env_patch is not None:
+            apply_env_patch(effective, env_patch)
+            # apply_env_patch leaves a .bak next to the shadow; the shadow is
+            # transient so we drop it to keep the staging directory clean.
+            shadow_bak = effective.with_name(effective.name + ENV_BACKUP_SUFFIX)
+            if shadow_bak.is_file():
+                shadow_bak.unlink()
+    return effective
+
+
+def _selfcheck_reason_from(exit_code: int, stderr_tail: str) -> str:
+    """Map a non-zero exit code to a short cause, appending the last structured line if present."""
+    mapping = {
+        SELFCHECK_EXIT_AGENT_ENV_MISSING: "agent.env missing",
+        SELFCHECK_EXIT_AGENT_ENV_INVALID: "agent.env missing required keys",
+        SELFCHECK_EXIT_APP_ENV_MISSING: "prod/app.env missing",
+        SELFCHECK_EXIT_APP_ENV_INVALID: "prod/app.env missing required keys",
+        SELFCHECK_EXIT_BROKER_LOOKUP: "broker lookup failed",
+        SELFCHECK_EXIT_MQTT_CONNECT: "mqtt connect failed",
+        SELFCHECK_EXIT_MQTT_ERROR: "mqtt setup error",
+        SELFCHECK_EXIT_SPAWN_TIMEOUT: "selfcheck timed out",
+        SELFCHECK_EXIT_SPAWN_ERROR: "selfcheck could not be spawned",
+    }
+    base = mapping.get(exit_code, f"selfcheck exit {exit_code}")
+    tail = ""
+    for line in reversed(stderr_tail.splitlines()):
+        if line.startswith("[selfcheck:"):
+            tail = line.strip()
+            break
+    return f"{base} ({tail})" if tail else base
+
+
+def run_candidate_selfcheck(script_path: Path, agent_env_path: Path, app_env_path: Path):
+    """
+    Spawn the candidate ota_agent.py with --selfcheck. Returns (exit_code, reason).
+    """
+    try:
+        result = subprocess.run(
+            [
+                sys.executable, str(script_path), SELFCHECK_FLAG,
+                SELFCHECK_AGENT_ENV_FLAG, str(agent_env_path),
+                SELFCHECK_APP_ENV_FLAG, str(app_env_path),
+            ],
+            capture_output=True, text=True, timeout=SELFCHECK_TIMEOUT_SECS,
+        )
+        stderr_tail = (result.stderr or "")[-SELFCHECK_STDERR_MAX_CHARS:]
+        if result.returncode == SELFCHECK_EXIT_OK:
+            return SELFCHECK_EXIT_OK, ""
+        return result.returncode, _selfcheck_reason_from(result.returncode, stderr_tail)
+    except subprocess.TimeoutExpired:
+        return SELFCHECK_EXIT_SPAWN_TIMEOUT, _selfcheck_reason_from(SELFCHECK_EXIT_SPAWN_TIMEOUT, "")
+    except OSError as e:
+        return SELFCHECK_EXIT_SPAWN_ERROR, f"selfcheck spawn error: {type(e).__name__}"
+
+
+def swap_agent_script(new_script: Path):
+    """Back up the current ota_agent.py and atomically replace it with the candidate."""
+    shutil.copy2(AGENT_SCRIPT_PATH, AGENT_SCRIPT_BAK)
+    tmp = AGENT_SCRIPT_PATH.with_name(AGENT_SCRIPT_PATH.name + ENV_TMP_SUFFIX)
+    tmp.write_bytes(new_script.read_bytes())
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, AGENT_SCRIPT_PATH)
+
+
+def swap_agent_env(new_env: Path):
+    """Back up the current agent.env and atomically replace it with the bundle's."""
+    shutil.copy2(AGENT_ENV_PATH, AGENT_ENV_BAK)
+    write_env_lines_atomically(AGENT_ENV_PATH, new_env.read_text().splitlines())
+
+
+def restore_agent_backups(script_was_swapped: bool, env_was_swapped: bool):
+    """Put .bak files back after a failed partial swap. Best-effort."""
+    if script_was_swapped and AGENT_SCRIPT_BAK.is_file():
+        try:
+            os.replace(AGENT_SCRIPT_BAK, AGENT_SCRIPT_PATH)
+        except OSError as e:
+            print(f"[error] Could not restore ota_agent.py from backup: {e}")
+    if env_was_swapped and AGENT_ENV_BAK.is_file():
+        try:
+            os.replace(AGENT_ENV_BAK, AGENT_ENV_PATH)
+        except OSError as e:
+            print(f"[error] Could not restore agent.env from backup: {e}")
+
+
+def handle_agent_ota_complete(client, session_id: str):
+    """
+    Full agent-OTA pipeline from a verified-complete session: SHA check,
+    extract, bundle-shape and env validation, PROD_DIR check, backup pruning,
+    selfcheck of the candidate, pm2 reachability check, atomic swap, ack,
+    restart-with-failure-ack. Every failure path keeps the current code
+    running and emits an ack with stage+reason.
+    """
+    sess = sessions.get(session_id)
+    if not sess:
+        return
+    manifest = sess["manifest"]
+
+    if len(sess["chunks"]) != manifest["total_chunks"]:
+        publish_agent_ack_failed(
+            client, ACK_STAGE_SHA,
+            f"missing chunks: {len(sess['chunks'])}/{manifest['total_chunks']}",
+        )
+        reset_session(session_id)
+        return
+
+    file_bytes = b"".join(sess["chunks"][i] for i in range(manifest["total_chunks"]))
+    sha = hashlib.sha256(file_bytes).hexdigest()
+    if sha != manifest["sha256"]:
+        publish_agent_ack_failed(client, ACK_STAGE_SHA, "sha256 mismatch")
+        reset_session(session_id)
+        return
+
+    try:
+        if AGENT_OTA_STAGING_DIR.exists():
+            shutil.rmtree(AGENT_OTA_STAGING_DIR)
+        AGENT_OTA_STAGING_DIR.mkdir(parents=True)
+        tar_file = AGENT_OTA_STAGING_DIR / manifest["filename"]
+        tar_file.write_bytes(file_bytes)
+        with tarfile.open(tar_file, "r:gz") as tar:
+            safe_extract(tar, AGENT_OTA_STAGING_DIR)
+    except Exception as e:
+        publish_agent_ack_failed(client, ACK_STAGE_EXTRACT, f"extract failed: {type(e).__name__}: {e}")
+        reset_session(session_id)
+        return
+
+    new_script = AGENT_OTA_STAGING_DIR / AGENT_BUNDLE_SCRIPT
+    new_env = AGENT_OTA_STAGING_DIR / AGENT_BUNDLE_ENV
+    new_env_patch = AGENT_OTA_STAGING_DIR / AGENT_BUNDLE_ENV_PATCH
+    has_script = new_script.is_file()
+    has_env = new_env.is_file()
+    has_env_patch = new_env_patch.is_file()
+
+    if has_env and has_env_patch:
+        publish_agent_ack_failed(
+            client, ACK_STAGE_BUNDLE_SHAPE,
+            f"{AGENT_BUNDLE_ENV} and {AGENT_BUNDLE_ENV_PATCH} are mutually exclusive",
+        )
+        reset_session(session_id)
+        return
+    if not (has_script or has_env or has_env_patch):
+        publish_agent_ack_failed(client, ACK_STAGE_BUNDLE_SHAPE, "bundle has nothing to apply")
+        reset_session(session_id)
+        return
+
+    env_patch = None
+    if has_env_patch:
+        try:
+            env_patch = load_agent_env_patch(new_env_patch)
+        except ValueError as e:
+            publish_agent_ack_failed(client, ACK_STAGE_ENV_VALIDATION, str(e))
+            reset_session(session_id)
+            return
+
+    prod_app_env = LIVE_CODE_DIR / DEVICE_ENV_FILE
+    if not LIVE_CODE_DIR.is_dir() or not prod_app_env.is_file():
+        publish_agent_ack_failed(
+            client, ACK_STAGE_PROD_DIR_CHECK,
+            f"PROD_DIR missing or has no {DEVICE_ENV_FILE}: {LIVE_CODE_DIR}",
+        )
+        reset_session(session_id)
+        return
+
+    # Clean out any .bak from a previous agent-OTA before we create fresh ones.
+    prune_agent_backups()
+
+    try:
+        effective_agent_env = materialise_effective_agent_env(
+            AGENT_OTA_STAGING_DIR, new_env, env_patch, has_env,
+        )
+    except Exception as e:
+        publish_agent_ack_failed(
+            client, ACK_STAGE_ENV_VALIDATION,
+            f"effective agent.env preparation failed: {type(e).__name__}: {e}",
+        )
+        reset_session(session_id)
+        return
+
+    # When the bundle has no new script, we validate the effective env against
+    # the current script's expectations — enough to catch missing keys or bad
+    # credentials; it does not prove the current script will tolerate new
+    # semantics, but there isn't one to validate against.
+    selfcheck_script = new_script if has_script else AGENT_SCRIPT_PATH
+    rc, reason = run_candidate_selfcheck(selfcheck_script, effective_agent_env, prod_app_env)
+    if rc != SELFCHECK_EXIT_OK:
+        publish_agent_ack_failed(client, ACK_STAGE_SELFCHECK, reason)
+        reset_session(session_id)
+        return
+
+    pm2_ok, pm2_detail = check_pm2_service_reachable(PM2_AGENT_SERVICE)
+    if not pm2_ok:
+        publish_agent_ack_failed(client, ACK_STAGE_PM2_REACHABLE, pm2_detail)
+        reset_session(session_id)
+        return
+
+    script_swapped = False
+    env_swapped = False
+    env_patch_changes = None
+    try:
+        if has_script:
+            swap_agent_script(new_script)
+            script_swapped = True
+        if has_env:
+            swap_agent_env(new_env)
+            env_swapped = True
+        elif env_patch is not None:
+            env_patch_changes = apply_env_patch(AGENT_ENV_PATH, env_patch)
+            env_swapped = bool(env_patch_changes and any(env_patch_changes.values()))
+    except Exception as e:
+        restore_agent_backups(script_swapped, env_swapped)
+        publish_agent_ack_failed(
+            client, ACK_STAGE_REPLACE,
+            f"swap failed: {type(e).__name__}: {e}",
+        )
+        reset_session(session_id)
+        return
+
+    publish_ack(
+        client, ACK_STATUS_UPDATED,
+        **{
+            ACK_KEY_MODULE: ACK_MODULE_AGENT,
+            "script_replaced": has_script,
+            "env_replaced": has_env,
+            "env_patch_applied": has_env_patch,
+            "env_changes": env_patch_changes,
+        },
+    )
+
+    reset_session(session_id)
+    schedule_agent_restart_with_failure_ack(client)
+
+
+
+
+# ==============================
+# Selfcheck (runs in the candidate agent's own process)
+# ==============================
+def _selfcheck_log(step: str, ok: bool, detail: str = ""):
+    """
+    Emit one line per selfcheck step. All output is structured as
+    `[selfcheck:<step>] ok|fail <detail>` so the parent can grep for failures
+    without the risk of pulling a credential value out of a random stderr line.
+    """
+    stream = sys.stdout if ok else sys.stderr
+    status = "ok" if ok else "fail"
+    message = f"[selfcheck:{step}] {status}"
+    if detail:
+        message = f"{message} {detail}"
+    print(message, file=stream, flush=True)
+
+
+def _selfcheck_env(step: str, env_path: Path, required_keys) -> int:
+    """Return 0 when env_path exists and defines every required key with a non-empty value."""
+    if not env_path.is_file():
+        _selfcheck_log(step, False, f"file missing: {env_path}")
+        return SELFCHECK_EXIT_AGENT_ENV_MISSING if step == "agent_env" else SELFCHECK_EXIT_APP_ENV_MISSING
+    values = dotenv_values(env_path)
+    missing = [key for key in required_keys if not values.get(key)]
+    if missing:
+        _selfcheck_log(step, False, f"missing keys: {','.join(missing)}")
+        return SELFCHECK_EXIT_AGENT_ENV_INVALID if step == "agent_env" else SELFCHECK_EXIT_APP_ENV_INVALID
+    _selfcheck_log(step, True)
+    return SELFCHECK_EXIT_OK
+
+
+def _selfcheck_mqtt_connect(broker: str, port: int, user: str, password: str, client_id: str) -> int:
+    """Attempt an MQTT connect-and-disconnect with the given credentials. No subscribe, no publish to shared topics."""
+    state = {"rc": None, "connected": False}
+
+    def _on_connect(_client, _userdata, _flags, rc, _properties=None):
+        state["rc"] = rc
+        state["connected"] = (rc == 0)
+
+    try:
+        client = paho.Client(client_id=client_id, userdata=None, protocol=paho.MQTTv5)
+        client.username_pw_set(user, password)
+        client.on_connect = _on_connect
+        client.tls_set(cert_reqs=paho.ssl.CERT_NONE)
+        client.tls_insecure_set(True)
+        client.connect(broker, port)
+    except Exception as e:
+        _selfcheck_log("mqtt_connect", False, f"setup error: {type(e).__name__}")
+        return SELFCHECK_EXIT_MQTT_ERROR
+
+    deadline = time.time() + SELFCHECK_CONNECT_TIMEOUT_SECS
+    while time.time() < deadline and not state["connected"]:
+        client.loop(timeout=0.5)
+
+    if not state["connected"]:
+        _selfcheck_log("mqtt_connect", False, f"not connected, rc={state['rc']}")
+        try:
+            client.disconnect()
+        except Exception:
+            pass
+        return SELFCHECK_EXIT_MQTT_CONNECT
+
+    try:
+        client.disconnect()
+    except Exception:
+        pass
+    _selfcheck_log("mqtt_connect", True)
+    return SELFCHECK_EXIT_OK
+
+
+def run_selfcheck(argv) -> int:
+    """
+    Candidate-agent entrypoint for `--selfcheck`. The running agent spawns
+    this on the proposed new ota_agent.py with the effective env paths. We
+    exit 0 only when imports, both env files, and MQTT connectivity all pass.
+    """
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(SELFCHECK_FLAG, action="store_true")
+    parser.add_argument(SELFCHECK_AGENT_ENV_FLAG, dest="agent_env", required=True)
+    parser.add_argument(SELFCHECK_APP_ENV_FLAG, dest="app_env", required=True)
+    args, _ = parser.parse_known_args(argv[1:])
+
+    # Imports reaching this point means every top-of-file import resolved.
+    _selfcheck_log("imports", True)
+
+    agent_env_path = Path(args.agent_env)
+    app_env_path = Path(args.app_env)
+
+    rc = _selfcheck_env("agent_env", agent_env_path, AGENT_ENV_REQUIRED_KEYS)
+    if rc != SELFCHECK_EXIT_OK:
+        return rc
+    rc = _selfcheck_env("app_env", app_env_path, APP_ENV_REQUIRED_KEYS)
+    if rc != SELFCHECK_EXIT_OK:
+        return rc
+
+    app_values = dotenv_values(app_env_path)
+    try:
+        broker = get_broker_from_db()
+    except SystemExit:
+        _selfcheck_log("broker_lookup", False, "db lookup failed")
+        return SELFCHECK_EXIT_BROKER_LOOKUP
+    _selfcheck_log("broker_lookup", True)
+
+    port = int(app_values[ENV_KEY_MQTT_PORT])
+    user = app_values[ENV_KEY_MQTT_USERNAME]
+    password = app_values[ENV_KEY_MQTT_PASSWORD]
+    client_id = f"{get_ethernet_mac()}{SELFCHECK_CLIENT_ID_SUFFIX}"
+
+    return _selfcheck_mqtt_connect(broker, port, user, password, client_id)
+
+
 # ==============================
 # MQTT callbacks
 # ==============================
@@ -462,15 +992,28 @@ def on_connect(client, userdata, flags, rc, properties=None):
     client.subscribe(f"{TOPIC}/+/chunks/meta/+")
     client.subscribe(f"{TOPIC}/+/chunks/data/+")
     client.subscribe(f"{TOPIC}/+/complete")
+    # Agent self-update pipeline on a separate topic tree.
+    client.subscribe(f"{AGENT_OTA_TOPIC}/+/manifest")
+    client.subscribe(f"{AGENT_OTA_TOPIC}/+/chunks/meta/+")
+    client.subscribe(f"{AGENT_OTA_TOPIC}/+/chunks/data/+")
+    client.subscribe(f"{AGENT_OTA_TOPIC}/+/complete")
 
 def on_message(client, userdata, msg):
-    topic_parts = msg.topic.split('/')
     # Topic layouts (session_id is a UUID from the publisher):
-    #   <TOPIC>/<session_id>/manifest
-    #   <TOPIC>/<session_id>/complete
-    #   <TOPIC>/<session_id>/chunks/<meta|data>/<index>
+    #   <root>/<session_id>/manifest
+    #   <root>/<session_id>/complete
+    #   <root>/<session_id>/chunks/<meta|data>/<index>
     # Session id is the segment right above the suffix: one back for
-    # manifest/complete, three back for chunks.
+    # manifest/complete, three back for chunks. The root picks the pipeline
+    # (TOPIC -> normal app OTA, AGENT_OTA_TOPIC -> agent self-update).
+    if msg.topic.startswith(AGENT_OTA_TOPIC + "/"):
+        kind = SESSION_KIND_AGENT
+    elif msg.topic.startswith(TOPIC + "/"):
+        kind = SESSION_KIND_APP
+    else:
+        return
+    topic_parts = msg.topic.split('/')
+
     if topic_parts[-1] in ("manifest", "complete") and len(topic_parts) >= 2:
         session_id = topic_parts[-2]
     elif len(topic_parts) >= 4 and topic_parts[-3] == "chunks":
@@ -483,11 +1026,23 @@ def on_message(client, userdata, msg):
         if not is_session_targeted(manifest.get(MANIFEST_KEY_TARGETS), MAC_ADDRESS):
             print(f"[info] Session {session_id} does not target this device, skipping")
             return
+        # Agent-OTA refuses to start while any other session is in flight: a
+        # collision between pipelines is treated as an accident, and the
+        # self-update loses (publisher will retry).
+        if kind == SESSION_KIND_AGENT and sessions:
+            other = next(iter(sessions.values()))
+            print(f"[warn] Agent-OTA manifest arrived while {other.get(SESSION_KIND_KEY)} session is active, rejecting")
+            publish_agent_ack_failed(
+                client, ACK_STAGE_CONCURRENCY,
+                f"another session in progress ({other.get(SESSION_KIND_KEY)})",
+            )
+            return
         sessions[session_id] = {
             "manifest": manifest,
             "chunks": {},
+            SESSION_KIND_KEY: kind,
         }
-        print(f"[info] New session {session_id}, expecting {manifest['total_chunks']} chunks")
+        print(f"[info] New {kind} session {session_id}, expecting {manifest['total_chunks']} chunks")
 
     elif "chunks" in topic_parts and topic_parts[-2] == "data":
         if session_id not in sessions:
@@ -500,6 +1055,9 @@ def on_message(client, userdata, msg):
         complete = json.loads(msg.payload.decode())
         if session_id not in sessions:
             print("[warn] Complete for unknown session")
+            return
+        if sessions[session_id].get(SESSION_KIND_KEY) == SESSION_KIND_AGENT:
+            handle_agent_ota_complete(client, session_id)
             return
         sess = sessions[session_id]
         manifest = sess["manifest"]
@@ -540,7 +1098,8 @@ def on_message(client, userdata, msg):
             env_patch = load_env_patch(STAGING_DIR)
         except (RuntimeError, ValueError) as e:
             print(f"[error] {e}. The current code keeps running.")
-            publish_ack(client, ACK_STATUS_FAILED, reason=str(e))
+            publish_ack(client, ACK_STATUS_FAILED,
+                        **{ACK_KEY_MODULE: ACK_MODULE_APP, ACK_KEY_REASON: str(e)})
             reset_session(session_id)
             return
 
@@ -555,7 +1114,9 @@ def on_message(client, userdata, msg):
                 create_app_env_from_bundle(STAGING_DIR / DEVICE_ENV_FILE, device_env)
             except OSError as e:
                 print(f"[error] Could not create {DEVICE_ENV_FILE}: {e}. The current code keeps running.")
-                publish_ack(client, ACK_STATUS_FAILED, reason=f"{DEVICE_ENV_FILE} not created: {e}")
+                publish_ack(client, ACK_STATUS_FAILED,
+                            **{ACK_KEY_MODULE: ACK_MODULE_APP,
+                               ACK_KEY_REASON: f"{DEVICE_ENV_FILE} not created: {e}"})
                 reset_session(session_id)
                 return
             print(f"[info] {DEVICE_ENV_FILE} created from the bundle")
@@ -568,7 +1129,9 @@ def on_message(client, userdata, msg):
                     env_changes = apply_env_patch(device_env, env_patch)
                 except OSError as e:
                     print(f"[error] Could not apply {ENV_PATCH_FILE}: {e}. The current code keeps running.")
-                    publish_ack(client, ACK_STATUS_FAILED, reason=f"{ENV_PATCH_FILE} not applied: {e}")
+                    publish_ack(client, ACK_STATUS_FAILED,
+                                **{ACK_KEY_MODULE: ACK_MODULE_APP,
+                                   ACK_KEY_REASON: f"{ENV_PATCH_FILE} not applied: {e}"})
                     reset_session(session_id)
                     return
                 env_patch_status = ENV_PATCH_STATUS_APPLIED
@@ -592,11 +1155,16 @@ def on_message(client, userdata, msg):
             env_restored = bool(env_changes and any(env_changes.values())) and restore_env_backup(device_env)
             print(f"[error] Replacing the live code failed: {e}"
                   f"{f' ({DEVICE_ENV_FILE} restored from backup)' if env_restored else ''}")
-            publish_ack(client, ACK_STATUS_FAILED, reason=f"replace failed: {e}", env_restored=env_restored)
+            publish_ack(client, ACK_STATUS_FAILED,
+                        **{ACK_KEY_MODULE: ACK_MODULE_APP,
+                           ACK_KEY_REASON: f"replace failed: {e}"},
+                        env_restored=env_restored)
             reset_session(session_id)
             return
 
-        publish_ack(client, ACK_STATUS_UPDATED, missing_env_keys=missing_env_keys,
+        publish_ack(client, ACK_STATUS_UPDATED,
+                    **{ACK_KEY_MODULE: ACK_MODULE_APP},
+                    missing_env_keys=missing_env_keys,
                     env_patch=env_patch_status, env_changes=env_changes,
                     app_env_created=app_env_created)
 
@@ -611,17 +1179,35 @@ def on_message(client, userdata, msg):
 # ==============================
 # Run
 # ==============================
+if __name__ == "__main__":
+    # The agent spawns itself with --selfcheck to validate a candidate
+    # ota_agent.py before committing the swap. That path must not touch the
+    # live broker, envs, or the main loop, so it exits here.
+    if SELFCHECK_FLAG in sys.argv:
+        sys.exit(run_selfcheck(sys.argv))
 
-client = paho.Client(client_id="", userdata=None, protocol=paho.MQTTv5)
-client.username_pw_set( USER, PASSWORD)
-client.on_connect = on_connect
-client.on_message = on_message
-try:
-    client.tls_set(cert_reqs=paho.ssl.CERT_NONE)
-    client.tls_insecure_set(True)
-    client.connect( BROKER, int(PORT))
-except Exception as e:
-    print(e , traceback.print_exc())
-    quit()
+    APP_ENV = load_required_env(APP_ENV_PATH, APP_ENV_REQUIRED_KEYS)
+    AGENT_ENV = load_required_env(AGENT_ENV_PATH, AGENT_ENV_REQUIRED_KEYS)
 
-client.loop_forever()
+    BROKER = get_broker_from_db()
+    PORT = APP_ENV[ENV_KEY_MQTT_PORT]
+    USER = APP_ENV[ENV_KEY_MQTT_USERNAME]
+    PASSWORD = APP_ENV[ENV_KEY_MQTT_PASSWORD]
+    TOPIC = AGENT_ENV[ENV_KEY_MQTT_BASE_TOPIC]
+
+    STAGING_DIR = Path(AGENT_ENV[ENV_KEY_STAGING_DIR])
+    LIVE_CODE_DIR = Path(AGENT_ENV[ENV_KEY_PROD_DIR])
+
+    client = paho.Client(client_id="", userdata=None, protocol=paho.MQTTv5)
+    client.username_pw_set(USER, PASSWORD)
+    client.on_connect = on_connect
+    client.on_message = on_message
+    try:
+        client.tls_set(cert_reqs=paho.ssl.CERT_NONE)
+        client.tls_insecure_set(True)
+        client.connect(BROKER, int(PORT))
+    except Exception as e:
+        print(e, traceback.print_exc())
+        quit()
+
+    client.loop_forever()

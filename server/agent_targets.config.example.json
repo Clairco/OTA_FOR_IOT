@@ -1,0 +1,8 @@
+{
+  "_help": "Copy this file to server/agent_targets.config.json (keep it git-ignored) and edit it before each agent-OTA publish. A separate file from targets.config.json on purpose: this pipeline replaces the OTA agent itself, so the target set should never be reused from the last normal OTA by accident. 'mode' is one of 'all', 'include', 'exclude'. 'devices' lists device names resolved through MongoDB.",
+
+  "mode": "include",
+  "devices": [
+    "thermopile-lab-01"
+  ]
+}
