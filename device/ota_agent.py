@@ -548,23 +548,35 @@ def check_pm2_service_reachable(service: str):
 
 def schedule_agent_restart_with_failure_ack(client):
     """
-    Agent-OTA variant of the restart: on failure (pm2 call returns non-zero or
-    raises), emit a correction ack with stage=pm2_restart. The ack can go out
-    because a failed pm2 restart leaves this process alive.
+    Agent-OTA variant of the restart: on failure (pm2 call errors or exits
+    with a positive status), emit a correction ack with stage=pm2_restart.
+
+    pm2 restart stops this process with SIGINT as part of a successful
+    restart. The pm2 CLI we spawn here is detached into its own process group
+    so that signal does not sweep it up; a negative returncode (signal death)
+    is still treated as success in case the detach does not take effect.
     """
     def restart():
         try:
-            subprocess.run(["pm2", "restart", PM2_AGENT_SERVICE], check=True, timeout=30)
-        except (subprocess.CalledProcessError, OSError, subprocess.TimeoutExpired) as e:
-            print(f"[error] pm2 restart failed after successful swap: {e}")
-            publish_ack(
-                client, ACK_STATUS_FAILED,
-                **{
-                    ACK_KEY_MODULE: ACK_MODULE_AGENT,
-                    ACK_KEY_STAGE: ACK_STAGE_PM2_RESTART,
-                    ACK_KEY_REASON: f"pm2 restart failed: {type(e).__name__}",
-                },
+            proc = subprocess.run(
+                ["pm2", "restart", PM2_AGENT_SERVICE],
+                timeout=30, start_new_session=True,
             )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            reason = f"pm2 restart failed: {type(e).__name__}"
+        else:
+            if proc.returncode <= 0:
+                return
+            reason = f"pm2 restart exit {proc.returncode}"
+        print(f"[error] {reason}")
+        publish_ack(
+            client, ACK_STATUS_FAILED,
+            **{
+                ACK_KEY_MODULE: ACK_MODULE_AGENT,
+                ACK_KEY_STAGE: ACK_STAGE_PM2_RESTART,
+                ACK_KEY_REASON: reason,
+            },
+        )
     threading.Timer(AGENT_RESTART_DELAY_IN_MS / MS_PER_SECOND, restart).start()
     print(f"[info] Agent restart ({PM2_AGENT_SERVICE}) scheduled in {AGENT_RESTART_DELAY_IN_MS} ms.")
 
