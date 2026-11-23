@@ -147,8 +147,8 @@ def _set_password_interactive(path: Path):
     print("[info] Pick a strong password — it gates every publish on this pipeline.")
     while True:
         pw1 = getpass.getpass("New agent-OTA password: ")
-        if len(pw1) < 12:
-            print("[warn] Must be at least 12 characters. Try again.")
+        if len(pw1) < 8:
+            print("[warn] Must be at least 8 characters. Try again.")
             continue
         pw2 = getpass.getpass("Confirm password: ")
         if pw1 != pw2:
