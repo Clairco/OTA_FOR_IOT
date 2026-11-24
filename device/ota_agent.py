@@ -156,6 +156,7 @@ AGENT_RESTART_DELAY_IN_MS = 3000
 MS_PER_SECOND = 1000
 
 sessions = {}
+skipped_sessions = set()
 
 # =============================
 # get mac address
@@ -455,6 +456,7 @@ def schedule_agent_restart():
 # ==============================
 def reset_session(session_id: str):
     sessions.pop(session_id, None)
+    skipped_sessions.discard(session_id)
 
 def on_connect(client, userdata, flags, rc, properties=None):
     print("[info] Connected with result code", rc)
@@ -482,6 +484,7 @@ def on_message(client, userdata, msg):
         manifest = json.loads(msg.payload.decode())
         if not is_session_targeted(manifest.get(MANIFEST_KEY_TARGETS), MAC_ADDRESS):
             print(f"[info] Session {session_id} does not target this device, skipping")
+            skipped_sessions.add(session_id)
             return
         sessions[session_id] = {
             "manifest": manifest,
@@ -497,6 +500,9 @@ def on_message(client, userdata, msg):
         print(f"[info] Got chunk {index} for {session_id} ({len(msg.payload)} bytes)")
 
     elif topic_parts[-1] == "complete":
+        if session_id in skipped_sessions:
+            skipped_sessions.discard(session_id)
+            return
         complete = json.loads(msg.payload.decode())
         if session_id not in sessions:
             print("[warn] Complete for unknown session")
