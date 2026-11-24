@@ -507,15 +507,16 @@ def on_message(client, userdata, msg):
         if session_id not in sessions:
             print("[warn] Complete for unknown session")
             return
-        sess = sessions[session_id]
-        manifest = sess["manifest"]
+        session = sessions[session_id]
+        manifest = session["manifest"]
+        received_chunks = session["chunks"]
 
-        if len(sess["chunks"]) != manifest["total_chunks"]:
-            print(f"[warn] Missing chunks: {len(sess['chunks'])}/{manifest['total_chunks']}")
+        if len(received_chunks) != manifest["total_chunks"]:
+            print(f"[warn] Missing chunks: {len(received_chunks)}/{manifest['total_chunks']}")
             reset_session(session_id)
             return
 
-        file_bytes = b''.join(sess["chunks"][i] for i in range(manifest["total_chunks"]))
+        file_bytes = b''.join(received_chunks[i] for i in range(manifest["total_chunks"]))
 
         sha = hashlib.sha256(file_bytes).hexdigest()
         if sha != manifest["sha256"]:
