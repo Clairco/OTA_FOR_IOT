@@ -15,6 +15,8 @@ from dotenv import dotenv_values
 
 from app_env_source import APP_ENV_ARCHIVE_NAME, APP_ENV_SOURCE_PATH, validate_app_env_source
 from device_targeting import (
+    MONGO_FIELD_MAC_DEFAULT,
+    MONGO_FIELD_NAME_DEFAULT,
     TargetingError,
     build_manifest_targets,
     confirm_deployment,
@@ -95,8 +97,8 @@ MQTT_BASE_TOPIC = _ENV["MQTT_BASE_TOPIC"]
 MONGO_URI = _ENV["MONGO_URI"]
 MONGO_DB = _ENV["MONGO_DB"]
 MONGO_COLLECTION = _ENV["MONGO_COLLECTION"]
-MONGO_NAME_FIELD = _ENV.get("MONGO_NAME_FIELD") or "sensorName"
-MONGO_MAC_FIELD = _ENV.get("MONGO_MAC_FIELD") or "macAddress"
+MONGO_NAME_FIELD = _ENV.get("MONGO_NAME_FIELD") or MONGO_FIELD_NAME_DEFAULT
+MONGO_MAC_FIELD = _ENV.get("MONGO_MAC_FIELD") or MONGO_FIELD_MAC_DEFAULT
 
 # Chunking (many brokers default-limit payloads; 256–512 KB is usually safe)
 CHUNK_SIZE = int(_ENV.get("CHUNK_SIZE") or 256 * 1024)  # 256 KB
