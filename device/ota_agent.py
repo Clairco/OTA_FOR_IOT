@@ -149,6 +149,13 @@ TARGETS_MODE_ALL = "all"
 TARGETS_MODE_INCLUDE = "include"
 TARGETS_MODE_EXCLUDE = "exclude"
 
+# MQTT topic segments: <TOPIC>/<session_id>/<segment>[/<data|meta>/<index>]
+TOPIC_SEG_MANIFEST = "manifest"
+TOPIC_SEG_COMPLETE = "complete"
+TOPIC_SEG_CHUNKS = "chunks"
+TOPIC_SEG_META = "meta"
+TOPIC_SEG_DATA = "data"
+
 PM2_SERVICES_TO_RESTART = ("scheduler", "app", "MQTT_Control_Consumer")
 PM2_AGENT_SERVICE = "ota"
 # Restarting the agent kills this process, so it waits for the ack to go out first.
@@ -460,10 +467,10 @@ def reset_session(session_id: str):
 
 def on_connect(client, userdata, flags, rc, properties=None):
     print("[info] Connected with result code", rc)
-    client.subscribe(f"{TOPIC}/+/manifest")
-    client.subscribe(f"{TOPIC}/+/chunks/meta/+")
-    client.subscribe(f"{TOPIC}/+/chunks/data/+")
-    client.subscribe(f"{TOPIC}/+/complete")
+    client.subscribe(f"{TOPIC}/+/{TOPIC_SEG_MANIFEST}")
+    client.subscribe(f"{TOPIC}/+/{TOPIC_SEG_CHUNKS}/{TOPIC_SEG_META}/+")
+    client.subscribe(f"{TOPIC}/+/{TOPIC_SEG_CHUNKS}/{TOPIC_SEG_DATA}/+")
+    client.subscribe(f"{TOPIC}/+/{TOPIC_SEG_COMPLETE}")
 
 def on_message(client, userdata, msg):
     topic_parts = msg.topic.split('/')
@@ -473,14 +480,14 @@ def on_message(client, userdata, msg):
     #   <TOPIC>/<session_id>/chunks/<meta|data>/<index>
     # Session id is the segment right above the suffix: one back for
     # manifest/complete, three back for chunks.
-    if topic_parts[-1] in ("manifest", "complete") and len(topic_parts) >= 2:
+    if topic_parts[-1] in (TOPIC_SEG_MANIFEST, TOPIC_SEG_COMPLETE) and len(topic_parts) >= 2:
         session_id = topic_parts[-2]
-    elif len(topic_parts) >= 4 and topic_parts[-3] == "chunks":
+    elif len(topic_parts) >= 4 and topic_parts[-3] == TOPIC_SEG_CHUNKS:
         session_id = topic_parts[-4]
     else:
         return
 
-    if topic_parts[-1] == "manifest":
+    if topic_parts[-1] == TOPIC_SEG_MANIFEST:
         manifest = json.loads(msg.payload.decode())
         if not is_session_targeted(manifest.get(MANIFEST_KEY_TARGETS), MAC_ADDRESS):
             print(f"[info] Session {session_id} does not target this device, skipping")
@@ -492,14 +499,14 @@ def on_message(client, userdata, msg):
         }
         print(f"[info] New session {session_id}, expecting {manifest['total_chunks']} chunks")
 
-    elif "chunks" in topic_parts and topic_parts[-2] == "data":
+    elif TOPIC_SEG_CHUNKS in topic_parts and topic_parts[-2] == TOPIC_SEG_DATA:
         if session_id not in sessions:
             return
         index = int(topic_parts[-1])
         sessions[session_id]["chunks"][index] = msg.payload
         print(f"[info] Got chunk {index} for {session_id} ({len(msg.payload)} bytes)")
 
-    elif topic_parts[-1] == "complete":
+    elif topic_parts[-1] == TOPIC_SEG_COMPLETE:
         if session_id in skipped_sessions:
             skipped_sessions.discard(session_id)
             return
