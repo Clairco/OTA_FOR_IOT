@@ -171,18 +171,17 @@ def resolve_targets(config: dict, all_devices: list) -> dict:
 
 
 def build_manifest_targets(resolved: dict) -> dict:
-    """Pick the smaller of include/exclude for the manifest payload."""
+    """Mirror the config mode in the manifest payload."""
     mode = resolved["config_mode"]
     if mode == TARGET_MODE_ALL:
         return {MANIFEST_KEY_MODE: TARGET_MODE_ALL}
 
-    effective_set = set(resolved["effective_macs"])
-    exclude_macs = [m for m in resolved["all_macs"] if m not in effective_set]
-    include_macs = list(resolved["effective_macs"])
+    if mode == TARGET_MODE_EXCLUDE:
+        effective_set = set(resolved["effective_macs"])
+        exclude_macs = [m for m in resolved["all_macs"] if m not in effective_set]
+        return {MANIFEST_KEY_MODE: TARGET_MODE_EXCLUDE, MANIFEST_KEY_MAC: exclude_macs}
 
-    if len(include_macs) <= len(exclude_macs):
-        return {MANIFEST_KEY_MODE: TARGET_MODE_INCLUDE, MANIFEST_KEY_MAC: include_macs}
-    return {MANIFEST_KEY_MODE: TARGET_MODE_EXCLUDE, MANIFEST_KEY_MAC: exclude_macs}
+    return {MANIFEST_KEY_MODE: TARGET_MODE_INCLUDE, MANIFEST_KEY_MAC: list(resolved["effective_macs"])}
 
 
 def confirm_deployment(resolved: dict, device_group: str, manifest_targets: dict) -> bool:
