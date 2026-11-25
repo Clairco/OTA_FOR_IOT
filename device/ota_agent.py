@@ -174,6 +174,13 @@ TARGETS_MODE_ALL = "all"
 TARGETS_MODE_INCLUDE = "include"
 TARGETS_MODE_EXCLUDE = "exclude"
 
+# MQTT topic segments: <TOPIC>/<session_id>/<segment>[/<data|meta>/<index>]
+TOPIC_SEG_MANIFEST = "manifest"
+TOPIC_SEG_COMPLETE = "complete"
+TOPIC_SEG_CHUNKS = "chunks"
+TOPIC_SEG_META = "meta"
+TOPIC_SEG_DATA = "data"
+
 PM2_SERVICES_TO_RESTART = ("scheduler", "app", "MQTT_Control_Consumer")
 PM2_AGENT_SERVICE = "ota"
 # Restarting the agent kills this process, so it waits for the ack to go out first.
@@ -233,6 +240,7 @@ SELFCHECK_EXIT_SPAWN_TIMEOUT = 97
 SELFCHECK_EXIT_SPAWN_ERROR = 98
 
 sessions = {}
+skipped_sessions = set()
 
 # =============================
 # get mac address
@@ -997,27 +1005,24 @@ def run_selfcheck(argv) -> int:
 # ==============================
 def reset_session(session_id: str):
     sessions.pop(session_id, None)
+    skipped_sessions.discard(session_id)
 
 def on_connect(client, userdata, flags, rc, properties=None):
     print("[info] Connected with result code", rc)
-    client.subscribe(f"{TOPIC}/+/manifest")
-    client.subscribe(f"{TOPIC}/+/chunks/meta/+")
-    client.subscribe(f"{TOPIC}/+/chunks/data/+")
-    client.subscribe(f"{TOPIC}/+/complete")
-    # Agent self-update pipeline on a separate topic tree.
-    client.subscribe(f"{AGENT_OTA_TOPIC}/+/manifest")
-    client.subscribe(f"{AGENT_OTA_TOPIC}/+/chunks/meta/+")
-    client.subscribe(f"{AGENT_OTA_TOPIC}/+/chunks/data/+")
-    client.subscribe(f"{AGENT_OTA_TOPIC}/+/complete")
+    for root in (TOPIC, AGENT_OTA_TOPIC):
+        client.subscribe(f"{root}/+/{TOPIC_SEG_MANIFEST}")
+        client.subscribe(f"{root}/+/{TOPIC_SEG_CHUNKS}/{TOPIC_SEG_META}/+")
+        client.subscribe(f"{root}/+/{TOPIC_SEG_CHUNKS}/{TOPIC_SEG_DATA}/+")
+        client.subscribe(f"{root}/+/{TOPIC_SEG_COMPLETE}")
 
 def on_message(client, userdata, msg):
     # Topic layouts (session_id is a UUID from the publisher):
     #   <root>/<session_id>/manifest
     #   <root>/<session_id>/complete
     #   <root>/<session_id>/chunks/<meta|data>/<index>
-    # Session id is the segment right above the suffix: one back for
-    # manifest/complete, three back for chunks. The root picks the pipeline
-    # (TOPIC -> normal app OTA, AGENT_OTA_TOPIC -> agent self-update).
+    # The root picks the pipeline (TOPIC -> normal app OTA, AGENT_OTA_TOPIC
+    # -> agent self-update). Session id is the segment right above the suffix:
+    # one back for manifest/complete, three back for chunks.
     if msg.topic.startswith(AGENT_OTA_TOPIC + "/"):
         kind = SESSION_KIND_AGENT
     elif msg.topic.startswith(TOPIC + "/"):
@@ -1026,17 +1031,18 @@ def on_message(client, userdata, msg):
         return
     topic_parts = msg.topic.split('/')
 
-    if topic_parts[-1] in ("manifest", "complete") and len(topic_parts) >= 2:
+    if topic_parts[-1] in (TOPIC_SEG_MANIFEST, TOPIC_SEG_COMPLETE) and len(topic_parts) >= 2:
         session_id = topic_parts[-2]
-    elif len(topic_parts) >= 4 and topic_parts[-3] == "chunks":
+    elif len(topic_parts) >= 4 and topic_parts[-3] == TOPIC_SEG_CHUNKS:
         session_id = topic_parts[-4]
     else:
         return
 
-    if topic_parts[-1] == "manifest":
+    if topic_parts[-1] == TOPIC_SEG_MANIFEST:
         manifest = json.loads(msg.payload.decode())
         if not is_session_targeted(manifest.get(MANIFEST_KEY_TARGETS), MAC_ADDRESS):
             print(f"[info] Session {session_id} does not target this device, skipping")
+            skipped_sessions.add(session_id)
             return
         # Agent-OTA refuses to start while any other session is in flight: a
         # collision between pipelines is treated as an accident, and the
@@ -1056,14 +1062,17 @@ def on_message(client, userdata, msg):
         }
         print(f"[info] New {kind} session {session_id}, expecting {manifest['total_chunks']} chunks")
 
-    elif "chunks" in topic_parts and topic_parts[-2] == "data":
+    elif TOPIC_SEG_CHUNKS in topic_parts and topic_parts[-2] == TOPIC_SEG_DATA:
         if session_id not in sessions:
             return
         index = int(topic_parts[-1])
         sessions[session_id]["chunks"][index] = msg.payload
         print(f"[info] Got chunk {index} for {session_id} ({len(msg.payload)} bytes)")
 
-    elif topic_parts[-1] == "complete":
+    elif topic_parts[-1] == TOPIC_SEG_COMPLETE:
+        if session_id in skipped_sessions:
+            skipped_sessions.discard(session_id)
+            return
         complete = json.loads(msg.payload.decode())
         if session_id not in sessions:
             print("[warn] Complete for unknown session")
@@ -1071,15 +1080,16 @@ def on_message(client, userdata, msg):
         if sessions[session_id].get(SESSION_KIND_KEY) == SESSION_KIND_AGENT:
             handle_agent_ota_complete(client, session_id)
             return
-        sess = sessions[session_id]
-        manifest = sess["manifest"]
+        session = sessions[session_id]
+        manifest = session["manifest"]
+        received_chunks = session["chunks"]
 
-        if len(sess["chunks"]) != manifest["total_chunks"]:
-            print(f"[warn] Missing chunks: {len(sess['chunks'])}/{manifest['total_chunks']}")
+        if len(received_chunks) != manifest["total_chunks"]:
+            print(f"[warn] Missing chunks: {len(received_chunks)}/{manifest['total_chunks']}")
             reset_session(session_id)
             return
 
-        file_bytes = b''.join(sess["chunks"][i] for i in range(manifest["total_chunks"]))
+        file_bytes = b''.join(received_chunks[i] for i in range(manifest["total_chunks"]))
 
         sha = hashlib.sha256(file_bytes).hexdigest()
         if sha != manifest["sha256"]:

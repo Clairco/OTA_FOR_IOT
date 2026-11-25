@@ -15,6 +15,8 @@ from dotenv import dotenv_values
 
 from app_env_source import APP_ENV_ARCHIVE_NAME, APP_ENV_SOURCE_PATH, validate_app_env_source
 from device_targeting import (
+    MONGO_FIELD_MAC_DEFAULT,
+    MONGO_FIELD_NAME_DEFAULT,
     TargetingError,
     build_manifest_targets,
     confirm_deployment,
@@ -95,8 +97,8 @@ MQTT_BASE_TOPIC = _ENV["MQTT_BASE_TOPIC"]
 MONGO_URI = _ENV["MONGO_URI"]
 MONGO_DB = _ENV["MONGO_DB"]
 MONGO_COLLECTION = _ENV["MONGO_COLLECTION"]
-MONGO_NAME_FIELD = _ENV.get("MONGO_NAME_FIELD") or "sensorName"
-MONGO_MAC_FIELD = _ENV.get("MONGO_MAC_FIELD") or "macAddress"
+MONGO_NAME_FIELD = _ENV.get("MONGO_NAME_FIELD") or MONGO_FIELD_NAME_DEFAULT
+MONGO_MAC_FIELD = _ENV.get("MONGO_MAC_FIELD") or MONGO_FIELD_MAC_DEFAULT
 
 # Chunking (many brokers default-limit payloads; 256–512 KB is usually safe)
 CHUNK_SIZE = int(_ENV.get("CHUNK_SIZE") or 256 * 1024)  # 256 KB
@@ -244,7 +246,7 @@ def send_archive_over_mqtt(archive_path: Path, base_topic: str, broker: str, por
 # Main flow
 # =========================
 def main():
-    DEVICE_GROUP = _ENV["DEVICE_GROUP"]
+    device_group = _ENV["DEVICE_GROUP"]
 
     # Resolve the target device set and confirm before touching anything else.
     # If the user declines (or the config is bad), the publisher exits before
@@ -266,7 +268,7 @@ def main():
         print("[error] Target set is empty, nothing to deploy to.", file=sys.stderr)
         sys.exit(2)
 
-    if not confirm_deployment(resolved, DEVICE_GROUP, manifest_targets):
+    if not confirm_deployment(resolved, device_group, manifest_targets):
         print("[info] Deployment cancelled.")
         sys.exit(0)
 
@@ -285,16 +287,16 @@ def main():
 
             with tempfile.TemporaryDirectory(prefix="repo_bundle_") as tmp:
                 out_dir = Path(tmp)
-                archive_path = make_tar_gz(repo, INCLUDE_PATHS, out_dir, f"{ARCHIVE_BASENAME}-{DEVICE_GROUP}", app_env_source)
+                archive_path = make_tar_gz(repo, INCLUDE_PATHS, out_dir, f"{ARCHIVE_BASENAME}-{device_group}", app_env_source)
                 print(f"[info] Archive created: {archive_path} ({archive_path.stat().st_size} bytes)")
 
                 file_hash = sha256_of_file(archive_path)
                 print(f"[info] SHA256: {file_hash}")
 
-                print(f"[info] Sending over MQTT to {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_BASE_TOPIC}/{DEVICE_GROUP}' ...")
+                print(f"[info] Sending over MQTT to {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_BASE_TOPIC}/{device_group}' ...")
                 result = send_archive_over_mqtt(
                     archive_path=archive_path,
-                    base_topic=MQTT_BASE_TOPIC + f"/{DEVICE_GROUP}",
+                    base_topic=MQTT_BASE_TOPIC + f"/{device_group}",
                     broker=MQTT_BROKER,
                     port=MQTT_PORT,
                     username=MQTT_USERNAME,
@@ -307,7 +309,7 @@ def main():
 
                 # Audit record is written only after the publish succeeds, so
                 # targets.resolved.json always reflects what was actually sent.
-                write_resolved_file(TARGETS_RESOLVED_PATH, DEVICE_GROUP, resolved, manifest_targets, archive_path.name)
+                write_resolved_file(TARGETS_RESOLVED_PATH, device_group, resolved, manifest_targets, archive_path.name)
                 print(f"[info] Target audit written to {TARGETS_RESOLVED_PATH}")
 
                 print("[info] MQTT send complete.")
