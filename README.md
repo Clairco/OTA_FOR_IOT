@@ -165,7 +165,7 @@ Every step (invocation, password accepted, risk acknowledged, published, aborted
 4. On selfcheck success: swaps `ota_agent.py` and `agent.env` atomically (with `.bak` copies preserved), acks on `OTA/ack` with `{"module": "ota_agent", "status": "updated"}`, and restarts itself via `pm2 restart ota`.
 5. On any failure: restores from `.bak`, acks with `{"module": "ota_agent", "status": "failed", "stage": ..., "reason": ...}`, and keeps running the old agent.
 
-Agent-OTA sessions are mutually exclusive with normal-OTA sessions on the device — if a normal OTA is mid-flight, an incoming agent manifest is rejected (and vice versa).
+An incoming agent-OTA manifest is rejected (with an `ACK_STAGE_CONCURRENCY` ack) if **any** other session is already in flight on the device — the self-update defers and the publisher is expected to retry. The guard is one-way: a normal-OTA manifest that arrives mid-agent-OTA is not rejected, because agent OTA is the high-risk pipeline that should step aside.
 
 
 
