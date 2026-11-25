@@ -173,6 +173,7 @@ def _set_password_interactive(path: Path):
         pass
     os.replace(tmp, path)
     print(f"[info] Password saved to {path}. Keep this file private; add it to .gitignore.")
+    _audit("password_set")
     return config
 
 
@@ -393,12 +394,15 @@ def main():
     env_values = _load_publisher_env(PUBLISHER_ENV_PATH)
 
     # Password gate ---------------------------------------------------------
+    # First-run writes the password hash but is NOT treated as authentication:
+    # the operator must re-enter the password they just set to get past the
+    # gate, so anyone who happens to run the tool before a real operator cannot
+    # self-authorise a publish by creating the config themselves.
     password_config = _load_password_config(AGENT_PASSWORD_CONFIG_PATH)
     if password_config is None:
         password_config = _set_password_interactive(AGENT_PASSWORD_CONFIG_PATH)
-        # On first-run the operator just set it, so we treat that as the auth.
-    else:
-        _prompt_and_verify_password(password_config)
+        print("[info] Re-enter the password you just set to continue.")
+    _prompt_and_verify_password(password_config)
     _audit("password_ok")
 
     # Target resolution ----------------------------------------------------

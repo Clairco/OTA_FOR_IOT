@@ -12,6 +12,7 @@ import sys
 import threading
 import traceback
 import sqlite3
+import uuid
 from pathlib import Path
 import paho.mqtt.client as paho
 from dotenv import dotenv_values
@@ -31,8 +32,12 @@ ENV_KEY_MQTT_PASSWORD = "MQTT_PASSWORD"
 ENV_KEY_MQTT_BASE_TOPIC = "MQTT_BASE_TOPIC"
 ENV_KEY_STAGING_DIR = "STAGING_DIR"
 ENV_KEY_PROD_DIR = "PROD_DIR"
+ENV_KEY_BROKER_DB_PATH = "BROKER_DB_PATH"
 APP_ENV_REQUIRED_KEYS = (ENV_KEY_MQTT_PORT, ENV_KEY_MQTT_USERNAME, ENV_KEY_MQTT_PASSWORD)
-AGENT_ENV_REQUIRED_KEYS = (ENV_KEY_MQTT_BASE_TOPIC, ENV_KEY_STAGING_DIR, ENV_KEY_PROD_DIR)
+AGENT_ENV_REQUIRED_KEYS = (ENV_KEY_MQTT_BASE_TOPIC, ENV_KEY_STAGING_DIR, ENV_KEY_PROD_DIR, ENV_KEY_BROKER_DB_PATH)
+
+BROKER_DB_TABLE = "static_ip_config"
+BROKER_DB_COLUMN = "staticIp"
 
 EXIT_CODE_CONFIG_ERROR = 1
 
@@ -53,20 +58,19 @@ def load_required_env(env_path: Path, required_keys) -> dict:
     return values
 
 
-def get_broker_from_db():
+def get_broker_from_db(db_path: str):
     try:
-        conn = sqlite3.connect("/home/clairco/Desktop/OTA/iot_data.db")
+        conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT staticIp FROM static_ip_config LIMIT 1;")
+        cursor.execute(f"SELECT {BROKER_DB_COLUMN} FROM {BROKER_DB_TABLE} LIMIT 1;")
         row = cursor.fetchone()
         conn.close()
         if row:
             return row[0]
-        else:
-            raise Exception("No MQTT_BROKER found in static_ip_config table")
+        raise RuntimeError(f"No broker address found in {BROKER_DB_TABLE} table")
     except Exception as e:
-        print(f"[error] Failed to fetch MQTT_BROKER from DB: {e}")
-        quit()
+        print(f"[error] Failed to fetch MQTT_BROKER from DB ({db_path}): {e}", file=sys.stderr)
+        sys.exit(EXIT_CODE_CONFIG_ERROR)
 
 
 # Env loading and MQTT client setup happen in the __main__ guard at the bottom
@@ -152,6 +156,7 @@ ACK_MODULE_AGENT = "ota_agent"       # agent self-update pipeline
 ACK_KEY_STAGE = "stage"
 ACK_KEY_REASON = "reason"
 ACK_STAGE_SHA = "sha_mismatch"
+ACK_STAGE_CHUNKS_MISSING = "chunks_missing"
 ACK_STAGE_EXTRACT = "extract"
 ACK_STAGE_BUNDLE_SHAPE = "bundle_shape"
 ACK_STAGE_ENV_VALIDATION = "env_validation"
@@ -755,7 +760,7 @@ def handle_agent_ota_complete(client, session_id: str):
 
     if len(sess["chunks"]) != manifest["total_chunks"]:
         publish_agent_ack_failed(
-            client, ACK_STAGE_SHA,
+            client, ACK_STAGE_CHUNKS_MISSING,
             f"missing chunks: {len(sess['chunks'])}/{manifest['total_chunks']}",
         )
         reset_session(session_id)
@@ -985,8 +990,13 @@ def run_selfcheck(argv) -> int:
         return rc
 
     app_values = dotenv_values(app_env_path)
+    agent_values = dotenv_values(agent_env_path)
+    broker_db_path = agent_values.get(ENV_KEY_BROKER_DB_PATH)
+    if not broker_db_path:
+        _selfcheck_log("broker_lookup", False, f"{ENV_KEY_BROKER_DB_PATH} not set in agent.env")
+        return SELFCHECK_EXIT_BROKER_LOOKUP
     try:
-        broker = get_broker_from_db()
+        broker = get_broker_from_db(broker_db_path)
     except SystemExit:
         _selfcheck_log("broker_lookup", False, "db lookup failed")
         return SELFCHECK_EXIT_BROKER_LOOKUP
@@ -1039,7 +1049,11 @@ def on_message(client, userdata, msg):
         return
 
     if topic_parts[-1] == TOPIC_SEG_MANIFEST:
-        manifest = json.loads(msg.payload.decode())
+        try:
+            manifest = json.loads(msg.payload.decode())
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            print(f"[warn] Dropping malformed manifest on {msg.topic}: {e}")
+            return
         if not is_session_targeted(manifest.get(MANIFEST_KEY_TARGETS), MAC_ADDRESS):
             print(f"[info] Session {session_id} does not target this device, skipping")
             skipped_sessions.add(session_id)
@@ -1054,6 +1068,7 @@ def on_message(client, userdata, msg):
                 client, ACK_STAGE_CONCURRENCY,
                 f"another session in progress ({other.get(SESSION_KIND_KEY)})",
             )
+            skipped_sessions.add(session_id)
             return
         sessions[session_id] = {
             "manifest": manifest,
@@ -1073,7 +1088,12 @@ def on_message(client, userdata, msg):
         if session_id in skipped_sessions:
             skipped_sessions.discard(session_id)
             return
-        complete = json.loads(msg.payload.decode())
+        try:
+            json.loads(msg.payload.decode())
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            print(f"[warn] Dropping malformed complete on {msg.topic}: {e}")
+            reset_session(session_id)
+            return
         if session_id not in sessions:
             print("[warn] Complete for unknown session")
             return
@@ -1211,7 +1231,7 @@ if __name__ == "__main__":
     APP_ENV = load_required_env(APP_ENV_PATH, APP_ENV_REQUIRED_KEYS)
     AGENT_ENV = load_required_env(AGENT_ENV_PATH, AGENT_ENV_REQUIRED_KEYS)
 
-    BROKER = get_broker_from_db()
+    BROKER = get_broker_from_db(AGENT_ENV[ENV_KEY_BROKER_DB_PATH])
     PORT = APP_ENV[ENV_KEY_MQTT_PORT]
     USER = APP_ENV[ENV_KEY_MQTT_USERNAME]
     PASSWORD = APP_ENV[ENV_KEY_MQTT_PASSWORD]
@@ -1229,7 +1249,8 @@ if __name__ == "__main__":
         client.tls_insecure_set(True)
         client.connect(BROKER, int(PORT))
     except Exception as e:
-        print(e, traceback.print_exc())
-        quit()
+        print(f"[error] MQTT connect failed: {e}", file=sys.stderr)
+        traceback.print_exc()
+        sys.exit(EXIT_CODE_CONFIG_ERROR)
 
     client.loop_forever()
