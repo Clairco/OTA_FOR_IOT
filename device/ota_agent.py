@@ -448,14 +448,15 @@ def format_env_line(key: str, value: str) -> str:
     return f"{key}={value}"
 
 
-def apply_env_patch(env_path: Path, patch: dict) -> dict:
+def apply_env_patch(env_path: Path, patch: dict):
     """
     Apply set_if_missing / set / remove to the device app.env in place.
 
     Comments, order and keys the patch doesn't mention are kept. Every line of
     a key is updated or removed (duplicates included). When something changes,
     the old file is kept as app.env.bak and the new one is written atomically
-    with mode 600. Returns the changed key names only, never values.
+    with mode 600. Returns the changed key names only, never values — or None
+    when the patch had no effect, so callers can use a plain truthiness check.
     """
     lines = env_path.read_text().splitlines()
     key_lines = {}
@@ -491,7 +492,7 @@ def apply_env_patch(env_path: Path, patch: dict) -> dict:
             changes["added"].append(key)
 
     if not any(changes.values()):
-        return changes
+        return None
 
     shutil.copy2(env_path, env_path.with_name(env_path.name + ENV_BACKUP_SUFFIX))
     write_env_lines_atomically(env_path, [line for line in lines if line is not None])
@@ -867,7 +868,7 @@ def handle_agent_ota_complete(client, session_id: str):
             env_swapped = True
         elif env_patch is not None:
             env_patch_changes = apply_env_patch(AGENT_ENV_PATH, env_patch)
-            env_swapped = bool(env_patch_changes and any(env_patch_changes.values()))
+            env_swapped = env_patch_changes is not None
     except Exception as e:
         restore_agent_backups(script_swapped, env_swapped)
         publish_agent_ack_failed(
@@ -1070,6 +1071,14 @@ def on_message(client, userdata, msg):
             )
             skipped_sessions.add(session_id)
             return
+        # App-OTA does not reject on collision (the publisher may legitimately
+        # retry a manifest with a fresh session_id), but two live app sessions
+        # racing to replace LIVE_CODE_DIR is a last-writer-wins situation that
+        # the operator should see in the logs.
+        if kind == SESSION_KIND_APP and sessions:
+            active_ids = [sid for sid in sessions if sid != session_id]
+            if active_ids:
+                print(f"[warn] App-OTA manifest {session_id} arrived while session(s) {active_ids} are still in flight; last to complete wins")
         sessions[session_id] = {
             "manifest": manifest,
             "chunks": {},
@@ -1177,8 +1186,11 @@ def on_message(client, userdata, msg):
                     reset_session(session_id)
                     return
                 env_patch_status = ENV_PATCH_STATUS_APPLIED
-                print(f"[info] {ENV_PATCH_FILE} applied to {DEVICE_ENV_FILE}: "
-                      f"added={env_changes['added']} updated={env_changes['updated']} removed={env_changes['removed']}")
+                if env_changes is not None:
+                    print(f"[info] {ENV_PATCH_FILE} applied to {DEVICE_ENV_FILE}: "
+                          f"added={env_changes['added']} updated={env_changes['updated']} removed={env_changes['removed']}")
+                else:
+                    print(f"[info] {ENV_PATCH_FILE} applied to {DEVICE_ENV_FILE}: no changes")
             else:
                 env_patch_status = ENV_PATCH_STATUS_NOT_TARGETED
                 print(f"[info] {ENV_PATCH_FILE} does not target this device, {DEVICE_ENV_FILE} unchanged")
@@ -1194,7 +1206,7 @@ def on_message(client, userdata, msg):
         except Exception as e:
             if app_env_created:
                 device_env.unlink(missing_ok=True)
-            env_restored = bool(env_changes and any(env_changes.values())) and restore_env_backup(device_env)
+            env_restored = env_changes is not None and restore_env_backup(device_env)
             print(f"[error] Replacing the live code failed: {e}"
                   f"{f' ({DEVICE_ENV_FILE} restored from backup)' if env_restored else ''}")
             publish_ack(client, ACK_STATUS_FAILED,
