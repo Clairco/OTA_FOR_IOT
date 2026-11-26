@@ -2,7 +2,7 @@
 Server-side deployment ack collector.
 
 Subscribes to OTA/ack on the publisher's existing paho client, correlates
-incoming acks by mac_Id against the resolved target list, and writes a
+incoming acks by mac against the resolved target list, and writes a
 per-deployment xlsx report under server/reports/.
 
 Attach ordering contract:
@@ -223,7 +223,7 @@ class DeploymentAckCollector:
             return
         if not isinstance(payload, dict):
             return
-        mac = (payload.get("mac_Id") or "").upper()
+        mac = (payload.get("mac") or "").upper()
         if not mac:
             return
         self._ingest(mac, payload, _now_utc_iso())
