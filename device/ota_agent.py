@@ -421,12 +421,18 @@ def is_session_targeted(targets, device_mac: str) -> bool:
     """
     True when the manifest's 'targets' block includes this device.
 
-    An absent block or mode='all' means every device. Unknown modes fail
-    closed, so a malformed manifest never installs on anything.
+    A missing block (None) means every device, for backwards compatibility
+    with older publishers. Any other shape — non-dict, missing mode key, or
+    unknown mode value — fails closed so a malformed manifest never installs
+    on anything.
     """
-    if not isinstance(targets, dict):
+    if targets is None:
         return True
-    mode = targets.get(TARGETS_KEY_MODE, TARGETS_MODE_ALL)
+    if not isinstance(targets, dict):
+        return False
+    if TARGETS_KEY_MODE not in targets:
+        return False
+    mode = targets[TARGETS_KEY_MODE]
     if mode == TARGETS_MODE_ALL:
         return True
     mac_list = targets.get(TARGETS_KEY_MAC, [])
@@ -511,7 +517,7 @@ def restore_env_backup(env_path: Path) -> bool:
 # Acknowledgement
 # ==============================
 def publish_ack(client, status: str, **details):
-    payload = {"mac_Id": MAC_ADDRESS, "status": status, **details}
+    payload = {"mac": MAC_ADDRESS, "status": status, **details}
     client.publish(ACK_TOPIC, payload=json.dumps(payload), qos=ACK_QOS)
 
 # ==============================
