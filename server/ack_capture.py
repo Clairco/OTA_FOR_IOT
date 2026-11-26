@@ -27,37 +27,114 @@ ACK_QOS = 2
 DEFAULT_ACK_WAIT_SECONDS = 300
 MAX_RAW_ACKS_PER_ROW = 10
 
-_TERMINAL_STATUSES = {"updated", "failed"}
+# Status values devices publish; anything else is treated as not-yet-terminal.
+ACK_STATUS_UPDATED = "updated"
+ACK_STATUS_FAILED = "failed"
+ACK_STATUS_TIMEOUT = "timeout"
+_TERMINAL_STATUSES = frozenset({ACK_STATUS_UPDATED, ACK_STATUS_FAILED})
+
+# Payload keys the device sends on each ack. Mirror of the device's ACK_KEY_*.
+ACK_PAYLOAD_KEY_MAC = "mac"
+ACK_PAYLOAD_KEY_STATUS = "status"
+ACK_PAYLOAD_KEY_MODULE = "module"
+ACK_PAYLOAD_KEY_STAGE = "stage"
+ACK_PAYLOAD_KEY_REASON = "reason"
+ACK_PAYLOAD_KEY_SCRIPT_REPLACED = "script_replaced"
+ACK_PAYLOAD_KEY_ENV_REPLACED = "env_replaced"
+ACK_PAYLOAD_KEY_ENV_PATCH_APPLIED = "env_patch_applied"
+ACK_PAYLOAD_KEY_ENV_CHANGES = "env_changes"
+ACK_PAYLOAD_KEY_MISSING_ENV_KEYS = "missing_env_keys"
+ACK_PAYLOAD_KEY_ENV_PATCH = "env_patch"
+ACK_PAYLOAD_KEY_APP_ENV_CREATED = "app_env_created"
+ACK_PAYLOAD_KEY_ENV_RESTORED = "env_restored"
+
+# Keys stored in the per-MAC in-memory row. "first_*" captures what the device
+# first reported (its intent); "last_*" captures the latest ack (useful for
+# retries). The xlsx reports the first-ack snapshot plus the raw list.
+ROW_KEY_SENSOR_NAME = "sensor_name"
+ROW_KEY_MAC = "mac"
+ROW_KEY_FIRST_STATUS = "first_status"
+ROW_KEY_FIRST_MODULE = "first_module"
+ROW_KEY_FIRST_STAGE = "first_stage"
+ROW_KEY_FIRST_REASON = "first_reason"
+ROW_KEY_LAST_STATUS = "last_status"
+ROW_KEY_LAST_MODULE = "last_module"
+ROW_KEY_LAST_STAGE = "last_stage"
+ROW_KEY_LAST_REASON = "last_reason"
+ROW_KEY_SCRIPT_REPLACED = ACK_PAYLOAD_KEY_SCRIPT_REPLACED
+ROW_KEY_ENV_REPLACED = ACK_PAYLOAD_KEY_ENV_REPLACED
+ROW_KEY_ENV_PATCH_APPLIED = ACK_PAYLOAD_KEY_ENV_PATCH_APPLIED
+ROW_KEY_ENV_CHANGES = ACK_PAYLOAD_KEY_ENV_CHANGES
+ROW_KEY_MISSING_ENV_KEYS = ACK_PAYLOAD_KEY_MISSING_ENV_KEYS
+ROW_KEY_ENV_PATCH = ACK_PAYLOAD_KEY_ENV_PATCH
+ROW_KEY_APP_ENV_CREATED = ACK_PAYLOAD_KEY_APP_ENV_CREATED
+ROW_KEY_ENV_RESTORED = ACK_PAYLOAD_KEY_ENV_RESTORED
+ROW_KEY_FIRST_ACK_AT_UTC = "first_ack_at_utc"
+ROW_KEY_LAST_ACK_AT_UTC = "last_ack_at_utc"
+ROW_KEY_ACK_COUNT = "ack_count"
+ROW_KEY_RAW_ACKS = "raw_acks"
+ROW_KEY_RAW_ACKS_TRUNCATED = "raw_acks_truncated"
+ROW_KEY_TERMINAL_SEEN = "_terminal_seen"
+
+# Keys for entries inside the raw-ack list.
+RAW_ACK_KEY_RECEIVED_AT = "received_at"
+RAW_ACK_KEY_PAYLOAD = "payload"
+
+# Target descriptor keys the publisher hands us in `expected_targets`.
+TARGET_KEY_NAME = "name"
+TARGET_KEY_MAC = "mac"
 
 # Column order for the xlsx report. Kept in one place so the header row and
 # the data row builder cannot drift apart.
+XLSX_COLUMN_SENSOR_NAME = "sensor_name"
+XLSX_COLUMN_MAC = "mac"
+XLSX_COLUMN_FINAL_STATUS = "final_status"
+XLSX_COLUMN_FIRST_STATUS = "first_status"
+XLSX_COLUMN_LAST_STATUS = "last_status"
+XLSX_COLUMN_MODULE = "module"
+XLSX_COLUMN_STAGE = "stage"
+XLSX_COLUMN_REASON = "reason"
+XLSX_COLUMN_SCRIPT_REPLACED = "script_replaced"
+XLSX_COLUMN_ENV_REPLACED = "env_replaced"
+XLSX_COLUMN_ENV_PATCH_APPLIED = "env_patch_applied"
+XLSX_COLUMN_ENV_CHANGES = "env_changes"
+XLSX_COLUMN_MISSING_ENV_KEYS = "missing_env_keys"
+XLSX_COLUMN_ENV_PATCH = "env_patch"
+XLSX_COLUMN_APP_ENV_CREATED = "app_env_created"
+XLSX_COLUMN_ENV_RESTORED = "env_restored"
+XLSX_COLUMN_FIRST_ACK_AT_UTC = "first_ack_at_utc"
+XLSX_COLUMN_LAST_ACK_AT_UTC = "last_ack_at_utc"
+XLSX_COLUMN_ACK_COUNT = "ack_count"
+XLSX_COLUMN_RAW_ACKS_JSON = "raw_acks_json"
+XLSX_COLUMN_RAW_ACKS_TRUNCATED = "raw_acks_truncated"
+
 _XLSX_COLUMNS = (
-    "sensor_name",
-    "mac",
-    "final_status",
-    "first_status",
-    "last_status",
-    "module",
-    "stage",
-    "reason",
-    "script_replaced",
-    "env_replaced",
-    "env_patch_applied",
-    "env_changes",
-    "missing_env_keys",
-    "env_patch",
-    "app_env_created",
-    "env_restored",
-    "first_ack_at_utc",
-    "last_ack_at_utc",
-    "ack_count",
-    "raw_acks_json",
-    "raw_acks_truncated",
+    XLSX_COLUMN_SENSOR_NAME, XLSX_COLUMN_MAC, XLSX_COLUMN_FINAL_STATUS,
+    XLSX_COLUMN_FIRST_STATUS, XLSX_COLUMN_LAST_STATUS,
+    XLSX_COLUMN_MODULE, XLSX_COLUMN_STAGE, XLSX_COLUMN_REASON,
+    XLSX_COLUMN_SCRIPT_REPLACED, XLSX_COLUMN_ENV_REPLACED,
+    XLSX_COLUMN_ENV_PATCH_APPLIED, XLSX_COLUMN_ENV_CHANGES,
+    XLSX_COLUMN_MISSING_ENV_KEYS, XLSX_COLUMN_ENV_PATCH,
+    XLSX_COLUMN_APP_ENV_CREATED, XLSX_COLUMN_ENV_RESTORED,
+    XLSX_COLUMN_FIRST_ACK_AT_UTC, XLSX_COLUMN_LAST_ACK_AT_UTC,
+    XLSX_COLUMN_ACK_COUNT, XLSX_COLUMN_RAW_ACKS_JSON,
+    XLSX_COLUMN_RAW_ACKS_TRUNCATED,
 )
+
+# Workbook layout.
+XLSX_SHEET_NAME = "acks"
+XLSX_FREEZE_PANES_CELL = "A2"
+
+# Timestamp formats.
+UTC_TIMESTAMP_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+REPORT_FILENAME_TIMESTAMP_FORMAT = "%Y%m%d-%H%M%S"
+# Short session suffix in the filename; the UUID is otherwise noisy.
+REPORT_SESSION_SHORT_LEN = 8
+REPORT_MISSING_SESSION_PLACEHOLDER = "nosession"
 
 
 def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime(UTC_TIMESTAMP_FORMAT)
 
 
 def _json_or_none(value):
@@ -91,10 +168,10 @@ class DeploymentAckCollector:
         self._pending = set()
 
         for target in expected_targets or []:
-            mac = (target.get("mac") or "").upper()
+            mac = (target.get(TARGET_KEY_MAC) or "").upper()
             if not mac:
                 continue
-            name = target.get("name") or mac
+            name = target.get(TARGET_KEY_NAME) or mac
             self._rows[mac] = self._new_row(name, mac)
             self._pending.add(mac)
 
@@ -104,30 +181,30 @@ class DeploymentAckCollector:
     @staticmethod
     def _new_row(sensor_name, mac):
         return {
-            "sensor_name": sensor_name,
-            "mac": mac,
-            "first_status": None,
-            "first_module": None,
-            "first_stage": None,
-            "first_reason": None,
-            "last_status": None,
-            "last_module": None,
-            "last_stage": None,
-            "last_reason": None,
-            "script_replaced": None,
-            "env_replaced": None,
-            "env_patch_applied": None,
-            "env_changes": None,
-            "missing_env_keys": None,
-            "env_patch": None,
-            "app_env_created": None,
-            "env_restored": None,
-            "first_ack_at_utc": None,
-            "last_ack_at_utc": None,
-            "ack_count": 0,
-            "raw_acks": [],
-            "raw_acks_truncated": False,
-            "_terminal_seen": False,
+            ROW_KEY_SENSOR_NAME: sensor_name,
+            ROW_KEY_MAC: mac,
+            ROW_KEY_FIRST_STATUS: None,
+            ROW_KEY_FIRST_MODULE: None,
+            ROW_KEY_FIRST_STAGE: None,
+            ROW_KEY_FIRST_REASON: None,
+            ROW_KEY_LAST_STATUS: None,
+            ROW_KEY_LAST_MODULE: None,
+            ROW_KEY_LAST_STAGE: None,
+            ROW_KEY_LAST_REASON: None,
+            ROW_KEY_SCRIPT_REPLACED: None,
+            ROW_KEY_ENV_REPLACED: None,
+            ROW_KEY_ENV_PATCH_APPLIED: None,
+            ROW_KEY_ENV_CHANGES: None,
+            ROW_KEY_MISSING_ENV_KEYS: None,
+            ROW_KEY_ENV_PATCH: None,
+            ROW_KEY_APP_ENV_CREATED: None,
+            ROW_KEY_ENV_RESTORED: None,
+            ROW_KEY_FIRST_ACK_AT_UTC: None,
+            ROW_KEY_LAST_ACK_AT_UTC: None,
+            ROW_KEY_ACK_COUNT: 0,
+            ROW_KEY_RAW_ACKS: [],
+            ROW_KEY_RAW_ACKS_TRUNCATED: False,
+            ROW_KEY_TERMINAL_SEEN: False,
         }
 
     def attach(self, client):
@@ -147,13 +224,13 @@ class DeploymentAckCollector:
     def wait(self):
         timed_out = not self._all_done.wait(self.wait_seconds)
         with self._lock:
-            updated = sum(1 for r in self._rows.values() if r["first_status"] == "updated")
-            failed = sum(1 for r in self._rows.values() if r["first_status"] == "failed")
-            pending = sum(1 for r in self._rows.values() if not r["_terminal_seen"])
+            updated = sum(1 for r in self._rows.values() if r[ROW_KEY_FIRST_STATUS] == ACK_STATUS_UPDATED)
+            failed = sum(1 for r in self._rows.values() if r[ROW_KEY_FIRST_STATUS] == ACK_STATUS_FAILED)
+            pending = sum(1 for r in self._rows.values() if not r[ROW_KEY_TERMINAL_SEEN])
         return {
             "total": len(self._rows),
-            "updated": updated,
-            "failed": failed,
+            ACK_STATUS_UPDATED: updated,
+            ACK_STATUS_FAILED: failed,
             "timed_out_count": pending,
             "timed_out": timed_out,
         }
@@ -166,9 +243,9 @@ class DeploymentAckCollector:
 
         wb = Workbook()
         ws = wb.active
-        ws.title = "acks"
+        ws.title = XLSX_SHEET_NAME
         ws.append(list(_XLSX_COLUMNS))
-        ws.freeze_panes = "A2"
+        ws.freeze_panes = XLSX_FREEZE_PANES_CELL
 
         with self._lock:
             rows_snapshot = [self._row_to_cells(r) for r in self._rows.values()]
@@ -180,39 +257,40 @@ class DeploymentAckCollector:
         return path
 
     def _default_report_path(self):
-        session_short = (self.session_id or "nosession").replace("-", "")[:8]
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        session_source = self.session_id or REPORT_MISSING_SESSION_PLACEHOLDER
+        session_short = session_source.replace("-", "")[:REPORT_SESSION_SHORT_LEN]
+        ts = datetime.now(timezone.utc).strftime(REPORT_FILENAME_TIMESTAMP_FORMAT)
         filename = f"{self.group}-{session_short}-{ts}.xlsx"
         return self.reports_dir / filename
 
     def _row_to_cells(self, row):
         final_status = (
-            row["first_status"]
-            if row["first_status"] in _TERMINAL_STATUSES
-            else "timeout"
+            row[ROW_KEY_FIRST_STATUS]
+            if row[ROW_KEY_FIRST_STATUS] in _TERMINAL_STATUSES
+            else ACK_STATUS_TIMEOUT
         )
         return [
-            row["sensor_name"],
-            row["mac"],
+            row[ROW_KEY_SENSOR_NAME],
+            row[ROW_KEY_MAC],
             final_status,
-            row["first_status"],
-            row["last_status"],
-            row["first_module"],
-            row["first_stage"],
-            row["first_reason"],
-            row["script_replaced"],
-            row["env_replaced"],
-            row["env_patch_applied"],
-            _json_or_none(row["env_changes"]),
-            _csv_or_none(row["missing_env_keys"]),
-            row["env_patch"],
-            row["app_env_created"],
-            row["env_restored"],
-            row["first_ack_at_utc"],
-            row["last_ack_at_utc"],
-            row["ack_count"],
-            _json_or_none(row["raw_acks"]) if row["raw_acks"] else None,
-            row["raw_acks_truncated"],
+            row[ROW_KEY_FIRST_STATUS],
+            row[ROW_KEY_LAST_STATUS],
+            row[ROW_KEY_FIRST_MODULE],
+            row[ROW_KEY_FIRST_STAGE],
+            row[ROW_KEY_FIRST_REASON],
+            row[ROW_KEY_SCRIPT_REPLACED],
+            row[ROW_KEY_ENV_REPLACED],
+            row[ROW_KEY_ENV_PATCH_APPLIED],
+            _json_or_none(row[ROW_KEY_ENV_CHANGES]),
+            _csv_or_none(row[ROW_KEY_MISSING_ENV_KEYS]),
+            row[ROW_KEY_ENV_PATCH],
+            row[ROW_KEY_APP_ENV_CREATED],
+            row[ROW_KEY_ENV_RESTORED],
+            row[ROW_KEY_FIRST_ACK_AT_UTC],
+            row[ROW_KEY_LAST_ACK_AT_UTC],
+            row[ROW_KEY_ACK_COUNT],
+            _json_or_none(row[ROW_KEY_RAW_ACKS]) if row[ROW_KEY_RAW_ACKS] else None,
+            row[ROW_KEY_RAW_ACKS_TRUNCATED],
         ]
 
     def _on_ack(self, client, userdata, msg):
@@ -223,10 +301,19 @@ class DeploymentAckCollector:
             return
         if not isinstance(payload, dict):
             return
-        mac = (payload.get("mac") or "").upper()
+        mac = (payload.get(ACK_PAYLOAD_KEY_MAC) or "").upper()
         if not mac:
             return
         self._ingest(mac, payload, _now_utc_iso())
+
+    # Payload keys that carry per-device outcome details. Stored on first
+    # non-null sighting (`_ingest` doesn't overwrite once set).
+    _PAYLOAD_DETAIL_KEYS = (
+        ACK_PAYLOAD_KEY_SCRIPT_REPLACED, ACK_PAYLOAD_KEY_ENV_REPLACED,
+        ACK_PAYLOAD_KEY_ENV_PATCH_APPLIED, ACK_PAYLOAD_KEY_ENV_CHANGES,
+        ACK_PAYLOAD_KEY_MISSING_ENV_KEYS, ACK_PAYLOAD_KEY_ENV_PATCH,
+        ACK_PAYLOAD_KEY_APP_ENV_CREATED, ACK_PAYLOAD_KEY_ENV_RESTORED,
+    )
 
     def _ingest(self, mac, payload, ts_iso):
         signal_done = False
@@ -236,37 +323,39 @@ class DeploymentAckCollector:
                 # Ack from a MAC outside the expected target set; ignore.
                 return
 
-            status = payload.get("status")
-            is_first = row["ack_count"] == 0
-            row["ack_count"] += 1
-            row["last_ack_at_utc"] = ts_iso
-            row["last_status"] = status
-            row["last_module"] = payload.get("module")
-            row["last_stage"] = payload.get("stage")
-            row["last_reason"] = payload.get("reason")
+            status = payload.get(ACK_PAYLOAD_KEY_STATUS)
+            module = payload.get(ACK_PAYLOAD_KEY_MODULE)
+            stage = payload.get(ACK_PAYLOAD_KEY_STAGE)
+            reason = payload.get(ACK_PAYLOAD_KEY_REASON)
+
+            is_first = row[ROW_KEY_ACK_COUNT] == 0
+            row[ROW_KEY_ACK_COUNT] += 1
+            row[ROW_KEY_LAST_ACK_AT_UTC] = ts_iso
+            row[ROW_KEY_LAST_STATUS] = status
+            row[ROW_KEY_LAST_MODULE] = module
+            row[ROW_KEY_LAST_STAGE] = stage
+            row[ROW_KEY_LAST_REASON] = reason
 
             if is_first:
-                row["first_ack_at_utc"] = ts_iso
-                row["first_status"] = status
-                row["first_module"] = payload.get("module")
-                row["first_stage"] = payload.get("stage")
-                row["first_reason"] = payload.get("reason")
+                row[ROW_KEY_FIRST_ACK_AT_UTC] = ts_iso
+                row[ROW_KEY_FIRST_STATUS] = status
+                row[ROW_KEY_FIRST_MODULE] = module
+                row[ROW_KEY_FIRST_STAGE] = stage
+                row[ROW_KEY_FIRST_REASON] = reason
 
-            for key in (
-                "script_replaced", "env_replaced", "env_patch_applied",
-                "env_changes", "missing_env_keys", "env_patch",
-                "app_env_created", "env_restored",
-            ):
+            for key in self._PAYLOAD_DETAIL_KEYS:
                 if key in payload and row.get(key) in (None, ""):
                     row[key] = payload[key]
 
-            if len(row["raw_acks"]) < MAX_RAW_ACKS_PER_ROW:
-                row["raw_acks"].append({"received_at": ts_iso, "payload": payload})
+            if len(row[ROW_KEY_RAW_ACKS]) < MAX_RAW_ACKS_PER_ROW:
+                row[ROW_KEY_RAW_ACKS].append(
+                    {RAW_ACK_KEY_RECEIVED_AT: ts_iso, RAW_ACK_KEY_PAYLOAD: payload}
+                )
             else:
-                row["raw_acks_truncated"] = True
+                row[ROW_KEY_RAW_ACKS_TRUNCATED] = True
 
-            if not row["_terminal_seen"] and status in _TERMINAL_STATUSES:
-                row["_terminal_seen"] = True
+            if not row[ROW_KEY_TERMINAL_SEEN] and status in _TERMINAL_STATUSES:
+                row[ROW_KEY_TERMINAL_SEEN] = True
                 self._pending.discard(mac)
                 if not self._pending:
                     signal_done = True

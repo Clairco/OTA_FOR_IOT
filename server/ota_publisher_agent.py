@@ -59,10 +59,7 @@ AGENT_BUNDLE_SCRIPT = "ota_agent.py"
 AGENT_BUNDLE_ENV = "agent.env"
 AGENT_BUNDLE_ENV_PATCH = "agent_env_patch.json"
 
-REQUIRED_ENV_KEYS = (
-    "MQTT_BROKER", "MQTT_PORT", "MQTT_USERNAME", "MQTT_PASSWORD",
-    "MONGO_URI", "MONGO_DB", "MONGO_COLLECTION",
-)
+# REQUIRED_ENV_KEYS is defined below once the PUB_ENV_KEY_* constants exist.
 
 # =========================
 # Password gate (PBKDF2, stdlib only)
@@ -71,9 +68,26 @@ REQUIRED_ENV_KEYS = (
 # file must brute-force the password to use it. Rotating the password just
 # means deleting the file and running the tool once to re-prompt.
 PASSWORD_KDF = "pbkdf2_sha256"
+PASSWORD_HASH_ALGO = "sha256"              # pbkdf2_hmac first arg
 PASSWORD_ITERATIONS = 200_000
 PASSWORD_SALT_BYTES = 16
 PASSWORD_KEY_BYTES = 32
+PASSWORD_MIN_LENGTH = 8                    # low floor; raise for stronger policy
+PASSWORD_ENCODING = "utf-8"
+
+# Keys inside agent_publisher.config.json.
+PASSWORD_CONFIG_KEY_KDF = "kdf"
+PASSWORD_CONFIG_KEY_ITERATIONS = "iterations"
+PASSWORD_CONFIG_KEY_SALT_HEX = "salt_hex"
+PASSWORD_CONFIG_KEY_HASH_HEX = "hash_hex"
+PASSWORD_CONFIG_KEY_CREATED_AT = "created_at"
+PASSWORD_CONFIG_REQUIRED_KEYS = (
+    PASSWORD_CONFIG_KEY_KDF, PASSWORD_CONFIG_KEY_ITERATIONS,
+    PASSWORD_CONFIG_KEY_SALT_HEX, PASSWORD_CONFIG_KEY_HASH_HEX,
+)
+
+PASSWORD_CONFIG_FILE_MODE = 0o600
+TMP_SUFFIX = ".tmp"
 
 # =========================
 # Risk acknowledgement
@@ -105,9 +119,81 @@ RISK_PROMPT_TEXT = (
 # =========================
 # MQTT publish settings
 # =========================
-DEFAULT_CHUNK_SIZE = 256 * 1024
+DEFAULT_CHUNK_SIZE_BYTES = 256 * 1024          # 256 KB; most brokers default-limit near here
 DEFAULT_QOS = 1
 RETAIN_MANIFEST = False
+MQTT_KEEPALIVE_SECS = 60
+
+# Size of each disk read when hashing the archive.
+SHA256_READ_BUFFER_BYTES = 1_048_576           # 1 MiB
+
+# Group label the ack collector stamps onto report filenames.
+PUBLISH_GROUP_AGENT = "ota_agent"
+
+# =========================
+# Manifest payload keys (must match the device's MANIFEST_KEY_* constants).
+# =========================
+MANIFEST_KEY_TYPE = "type"
+MANIFEST_KEY_SESSION_ID = "session_id"
+MANIFEST_KEY_FILENAME = "filename"
+MANIFEST_KEY_SIZE_BYTES = "size_bytes"
+MANIFEST_KEY_SHA256 = "sha256"
+MANIFEST_KEY_CHUNK_SIZE = "chunk_size"
+MANIFEST_KEY_TOTAL_CHUNKS = "total_chunks"
+MANIFEST_KEY_CREATED_AT = "created_at"
+MANIFEST_KEY_TARGETS = "targets"
+MANIFEST_KEY_SIG = "sig"
+
+MANIFEST_TYPE_MANIFEST = "manifest"
+MANIFEST_TYPE_CHUNK = "chunk"
+MANIFEST_TYPE_COMPLETE = "complete"
+
+CHUNK_META_KEY_TYPE = "type"
+CHUNK_META_KEY_INDEX = "index"
+CHUNK_META_KEY_TOTAL = "total"
+
+# =========================
+# publisher.env keys (must stay in sync with publisher.env.example).
+# =========================
+PUB_ENV_KEY_MQTT_BROKER = "MQTT_BROKER"
+PUB_ENV_KEY_MQTT_PORT = "MQTT_PORT"
+PUB_ENV_KEY_MQTT_USERNAME = "MQTT_USERNAME"
+PUB_ENV_KEY_MQTT_PASSWORD = "MQTT_PASSWORD"
+PUB_ENV_KEY_MONGO_URI = "MONGO_URI"
+PUB_ENV_KEY_MONGO_DB = "MONGO_DB"
+PUB_ENV_KEY_MONGO_COLLECTION = "MONGO_COLLECTION"
+PUB_ENV_KEY_MONGO_NAME_FIELD = "MONGO_NAME_FIELD"
+PUB_ENV_KEY_MONGO_MAC_FIELD = "MONGO_MAC_FIELD"
+PUB_ENV_KEY_ACK_WAIT_SECONDS = "ACK_WAIT_SECONDS"
+
+# Mongo field-name defaults (when the env doesn't override them).
+MONGO_NAME_FIELD_DEFAULT = "sensorName"
+MONGO_MAC_FIELD_DEFAULT = "macAddress"
+
+TARGETS_CONFIG_MODE_ALL = "all"
+EXPECTED_TARGET_KEY_NAME = "name"
+EXPECTED_TARGET_KEY_MAC = "mac"
+REPORTS_DIR_NAME = "reports"
+
+# Operator-identity fallbacks for the audit log.
+OPERATOR_ENV_KEY_UNIX = "USER"
+OPERATOR_ENV_KEY_WINDOWS = "USERNAME"
+OPERATOR_UNKNOWN = "unknown"
+
+# Audit log event names.
+AUDIT_EVENT_PASSWORD_SET = "password_set"
+AUDIT_EVENT_INVOKED = "invoked"
+AUDIT_EVENT_PASSWORD_OK = "password_ok"
+AUDIT_EVENT_ABORTED = "aborted"
+AUDIT_EVENT_RISK_ACK = "risk_ack"
+AUDIT_EVENT_FAILED = "failed"
+AUDIT_EVENT_PUBLISHED = "published"
+
+REQUIRED_ENV_KEYS = (
+    PUB_ENV_KEY_MQTT_BROKER, PUB_ENV_KEY_MQTT_PORT,
+    PUB_ENV_KEY_MQTT_USERNAME, PUB_ENV_KEY_MQTT_PASSWORD,
+    PUB_ENV_KEY_MONGO_URI, PUB_ENV_KEY_MONGO_DB, PUB_ENV_KEY_MONGO_COLLECTION,
+)
 
 # =========================
 # Env + config loaders
@@ -130,16 +216,19 @@ def _load_password_config(path: Path):
         config = json.loads(path.read_text())
     except json.JSONDecodeError as e:
         sys.exit(f"[error] {path} is not valid JSON: {e}")
-    for required in ("kdf", "iterations", "salt_hex", "hash_hex"):
+    for required in PASSWORD_CONFIG_REQUIRED_KEYS:
         if required not in config:
             sys.exit(f"[error] {path} missing field: {required}")
-    if config["kdf"] != PASSWORD_KDF:
-        sys.exit(f"[error] {path} uses unsupported kdf: {config['kdf']}")
+    if config[PASSWORD_CONFIG_KEY_KDF] != PASSWORD_KDF:
+        sys.exit(f"[error] {path} uses unsupported kdf: {config[PASSWORD_CONFIG_KEY_KDF]}")
     return config
 
 
 def _derive_password_hash(password: str, salt: bytes, iterations: int) -> bytes:
-    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations, dklen=PASSWORD_KEY_BYTES)
+    return hashlib.pbkdf2_hmac(
+        PASSWORD_HASH_ALGO, password.encode(PASSWORD_ENCODING), salt, iterations,
+        dklen=PASSWORD_KEY_BYTES,
+    )
 
 
 def _set_password_interactive(path: Path):
@@ -148,8 +237,8 @@ def _set_password_interactive(path: Path):
     print("[info] Pick a strong password — it gates every publish on this pipeline.")
     while True:
         pw1 = getpass.getpass("New agent-OTA password: ")
-        if len(pw1) < 8:
-            print("[warn] Must be at least 8 characters. Try again.")
+        if len(pw1) < PASSWORD_MIN_LENGTH:
+            print(f"[warn] Must be at least {PASSWORD_MIN_LENGTH} characters. Try again.")
             continue
         pw2 = getpass.getpass("Confirm password: ")
         if pw1 != pw2:
@@ -159,31 +248,31 @@ def _set_password_interactive(path: Path):
     salt = secrets.token_bytes(PASSWORD_SALT_BYTES)
     digest = _derive_password_hash(pw1, salt, PASSWORD_ITERATIONS)
     config = {
-        "kdf": PASSWORD_KDF,
-        "iterations": PASSWORD_ITERATIONS,
-        "salt_hex": salt.hex(),
-        "hash_hex": digest.hex(),
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        PASSWORD_CONFIG_KEY_KDF: PASSWORD_KDF,
+        PASSWORD_CONFIG_KEY_ITERATIONS: PASSWORD_ITERATIONS,
+        PASSWORD_CONFIG_KEY_SALT_HEX: salt.hex(),
+        PASSWORD_CONFIG_KEY_HASH_HEX: digest.hex(),
+        PASSWORD_CONFIG_KEY_CREATED_AT: datetime.now(timezone.utc).isoformat(),
     }
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp = path.with_suffix(path.suffix + TMP_SUFFIX)
     tmp.write_text(json.dumps(config, indent=2))
     try:
-        os.chmod(tmp, 0o600)
+        os.chmod(tmp, PASSWORD_CONFIG_FILE_MODE)
     except OSError:
         # Windows filesystems may not honour this; the file is still gitignored.
         pass
     os.replace(tmp, path)
     print(f"[info] Password saved to {path}. Keep this file private; add it to .gitignore.")
-    _audit("password_set")
+    _audit(AUDIT_EVENT_PASSWORD_SET)
     return config
 
 
 def _prompt_and_verify_password(config: dict):
     """Ask the operator for the password; exit on mismatch. No retries."""
     entered = getpass.getpass("Agent-OTA publisher password: ")
-    salt = bytes.fromhex(config["salt_hex"])
-    expected = bytes.fromhex(config["hash_hex"])
-    derived = _derive_password_hash(entered, salt, int(config["iterations"]))
+    salt = bytes.fromhex(config[PASSWORD_CONFIG_KEY_SALT_HEX])
+    expected = bytes.fromhex(config[PASSWORD_CONFIG_KEY_HASH_HEX])
+    derived = _derive_password_hash(entered, salt, int(config[PASSWORD_CONFIG_KEY_ITERATIONS]))
     if not hmac.compare_digest(derived, expected):
         sys.exit("[error] Password did not match. Aborting.")
     print("[info] Password accepted.")
@@ -206,12 +295,16 @@ def _audit(event: str, **details):
         record = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "event": event,
-            "operator": os.environ.get("USER") or os.environ.get("USERNAME") or "unknown",
+            "operator": (
+                os.environ.get(OPERATOR_ENV_KEY_UNIX)
+                or os.environ.get(OPERATOR_ENV_KEY_WINDOWS)
+                or OPERATOR_UNKNOWN
+            ),
             "host": socket.gethostname(),
             "pid": os.getpid(),
             **details,
         }
-        with AUDIT_LOG_PATH.open("a", encoding="utf-8") as f:
+        with AUDIT_LOG_PATH.open("a", encoding=PASSWORD_ENCODING) as f:
             f.write(json.dumps(record) + "\n")
     except Exception as e:
         print(f"[warn] Audit log write failed: {e}", file=sys.stderr)
@@ -221,7 +314,17 @@ def _audit(event: str, **details):
 # Bundle construction
 # =========================
 AGENT_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-VALID_PATCH_SECTIONS = frozenset({"set", "set_if_missing", "remove", "targets"})
+
+# env-patch section names (must mirror the device's ENV_PATCH_* constants).
+PATCH_SECTION_SET = "set"
+PATCH_SECTION_SET_IF_MISSING = "set_if_missing"
+PATCH_SECTION_REMOVE = "remove"
+PATCH_SECTION_TARGETS = "targets"
+VALID_PATCH_SECTIONS = frozenset({
+    PATCH_SECTION_SET, PATCH_SECTION_SET_IF_MISSING,
+    PATCH_SECTION_REMOVE, PATCH_SECTION_TARGETS,
+})
+PATCH_NOTE_PREFIX = "_"
 
 
 def _validate_env_patch_file(path: Path):
@@ -232,11 +335,11 @@ def _validate_env_patch_file(path: Path):
         sys.exit(f"[error] {path} is not valid JSON: {e}")
     if not isinstance(patch, dict):
         sys.exit(f"[error] {path} must be a JSON object")
-    patch_sections = {key for key in patch if not key.startswith("_")}
+    patch_sections = {key for key in patch if not key.startswith(PATCH_NOTE_PREFIX)}
     unknown = patch_sections - VALID_PATCH_SECTIONS
     if unknown:
         sys.exit(f"[error] {path}: unknown sections {sorted(unknown)}")
-    for section in ("set", "set_if_missing"):
+    for section in (PATCH_SECTION_SET, PATCH_SECTION_SET_IF_MISSING):
         values = patch.get(section, {})
         if not isinstance(values, dict):
             sys.exit(f"[error] {path}: '{section}' must be a JSON object")
@@ -245,9 +348,9 @@ def _validate_env_patch_file(path: Path):
                 sys.exit(f"[error] {path}: invalid key '{key}' in '{section}'")
             if not isinstance(value, str):
                 sys.exit(f"[error] {path}: value of '{key}' in '{section}' must be a string")
-    removed = patch.get("remove", [])
+    removed = patch.get(PATCH_SECTION_REMOVE, [])
     if not isinstance(removed, list) or not all(isinstance(k, str) and AGENT_ENV_KEY_PATTERN.match(k) for k in removed):
-        sys.exit(f"[error] {path}: 'remove' must be a list of key names")
+        sys.exit(f"[error] {path}: '{PATCH_SECTION_REMOVE}' must be a list of key names")
 
 
 def _validate_script_file(path: Path):
@@ -259,11 +362,18 @@ def _validate_script_file(path: Path):
         sys.exit(f"[error] {path} fails to compile: {e.msg.strip()}")
 
 
+AGENT_BUNDLE_ARCHIVE_PREFIX = "agent_bundle-"
+AGENT_BUNDLE_ARCHIVE_SUFFIX = ".tar.gz"
+AGENT_BUNDLE_TIMESTAMP_FORMAT = "%Y%m%d-%H%M%S"
+TAR_WRITE_GZIP_MODE = "w:gz"
+FILE_READ_BINARY_MODE = "rb"
+
+
 def build_agent_bundle(script_path, env_path, env_patch_path, out_dir: Path) -> Path:
     """Pack whichever of the three pieces the operator passed into one .tar.gz."""
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    archive_path = out_dir / f"agent_bundle-{timestamp}.tar.gz"
-    with tarfile.open(archive_path, "w:gz") as tar:
+    timestamp = time.strftime(AGENT_BUNDLE_TIMESTAMP_FORMAT)
+    archive_path = out_dir / f"{AGENT_BUNDLE_ARCHIVE_PREFIX}{timestamp}{AGENT_BUNDLE_ARCHIVE_SUFFIX}"
+    with tarfile.open(archive_path, TAR_WRITE_GZIP_MODE) as tar:
         if script_path:
             tar.add(script_path, arcname=AGENT_BUNDLE_SCRIPT)
         if env_path:
@@ -275,8 +385,8 @@ def build_agent_bundle(script_path, env_path, env_patch_path, out_dir: Path) -> 
 
 def sha256_of_file(path: Path) -> str:
     h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1_048_576), b""):
+    with path.open(FILE_READ_BINARY_MODE) as f:
+        for chunk in iter(lambda: f.read(SHA256_READ_BUFFER_BYTES), b""):
             h.update(chunk)
     return h.hexdigest()
 
@@ -294,7 +404,7 @@ def send_bundle_over_mqtt(archive_path: Path, broker: str, port: int, username: 
     client.username_pw_set(username, password)
 
     try:
-        client.connect(broker, port, keepalive=60)
+        client.connect(broker, port, keepalive=MQTT_KEEPALIVE_SECS)
         client.loop_start()
 
         data = archive_path.read_bytes()
@@ -304,6 +414,8 @@ def send_bundle_over_mqtt(archive_path: Path, broker: str, port: int, username: 
 
         session_id = str(uuid.uuid4())
         topic_prefix = f"{AGENT_OTA_TOPIC}/{session_id}"
+        manifest_topic = f"{topic_prefix}/{MANIFEST_TYPE_MANIFEST}"
+        complete_topic = f"{topic_prefix}/{MANIFEST_TYPE_COMPLETE}"
 
         collector = DeploymentAckCollector(
             group=group,
@@ -315,33 +427,41 @@ def send_bundle_over_mqtt(archive_path: Path, broker: str, port: int, username: 
         collector.attach(client)
 
         manifest = {
-            "type": "manifest",
-            "session_id": session_id,
-            "filename": archive_path.name,
-            "size_bytes": total_size,
-            "sha256": file_hash,
-            "chunk_size": chunk_size,
-            "total_chunks": total_chunks,
-            "created_at": int(time.time()),
-            "targets": manifest_targets or {"mode": "all"},
+            MANIFEST_KEY_TYPE: MANIFEST_TYPE_MANIFEST,
+            MANIFEST_KEY_SESSION_ID: session_id,
+            MANIFEST_KEY_FILENAME: archive_path.name,
+            MANIFEST_KEY_SIZE_BYTES: total_size,
+            MANIFEST_KEY_SHA256: file_hash,
+            MANIFEST_KEY_CHUNK_SIZE: chunk_size,
+            MANIFEST_KEY_TOTAL_CHUNKS: total_chunks,
+            MANIFEST_KEY_CREATED_AT: int(time.time()),
+            MANIFEST_KEY_TARGETS: manifest_targets or {"mode": TARGETS_CONFIG_MODE_ALL},
             # Forward-compatible slot; the device agent does not verify it yet.
-            "sig": None,
+            MANIFEST_KEY_SIG: None,
         }
 
-        info = client.publish(f"{topic_prefix}/manifest", json.dumps(manifest), qos=qos, retain=RETAIN_MANIFEST)
+        info = client.publish(manifest_topic, json.dumps(manifest), qos=qos, retain=RETAIN_MANIFEST)
         info.wait_for_publish()
 
         for i in range(total_chunks):
             start = i * chunk_size
             end = min(start + chunk_size, total_size)
             payload = data[start:end]
-            meta = {"type": "chunk", "index": i, "total": total_chunks}
+            meta = {
+                CHUNK_META_KEY_TYPE: MANIFEST_TYPE_CHUNK,
+                CHUNK_META_KEY_INDEX: i,
+                CHUNK_META_KEY_TOTAL: total_chunks,
+            }
             client.publish(f"{topic_prefix}/chunks/meta/{i}", json.dumps(meta), qos=qos)
             info = client.publish(f"{topic_prefix}/chunks/data/{i}", payload, qos=qos)
             info.wait_for_publish()
 
-        complete = {"type": "complete", "session_id": session_id, "sha256": file_hash}
-        info = client.publish(f"{topic_prefix}/complete", json.dumps(complete), qos=qos)
+        complete = {
+            MANIFEST_KEY_TYPE: MANIFEST_TYPE_COMPLETE,
+            MANIFEST_KEY_SESSION_ID: session_id,
+            MANIFEST_KEY_SHA256: file_hash,
+        }
+        info = client.publish(complete_topic, json.dumps(complete), qos=qos)
         info.wait_for_publish()
 
         print(f"[info] Waiting up to {ack_wait_seconds}s for device acks ...")
@@ -373,7 +493,7 @@ def _parse_args():
     parser.add_argument("--script", type=Path, help="Path to the new ota_agent.py to ship.")
     parser.add_argument("--agent-env", type=Path, help="Path to a full replacement agent.env.")
     parser.add_argument("--agent-env-patch", type=Path, help="Path to an agent_env_patch.json diff.")
-    parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
+    parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE_BYTES)
     parser.add_argument("--qos", type=int, default=DEFAULT_QOS, choices=(0, 1, 2))
     args = parser.parse_args()
     if args.agent_env and args.agent_env_patch:
@@ -406,7 +526,7 @@ def _resolve_inputs(args):
 def main():
     args = _parse_args()
     script, env, patch = _resolve_inputs(args)
-    _audit("invoked", script=str(script) if script else None,
+    _audit(AUDIT_EVENT_INVOKED, script=str(script) if script else None,
                      agent_env=str(env) if env else None,
                      agent_env_patch=str(patch) if patch else None)
 
@@ -422,42 +542,42 @@ def main():
         password_config = _set_password_interactive(AGENT_PASSWORD_CONFIG_PATH)
         print("[info] Re-enter the password you just set to continue.")
     _prompt_and_verify_password(password_config)
-    _audit("password_ok")
+    _audit(AUDIT_EVENT_PASSWORD_OK)
 
     # Target resolution ----------------------------------------------------
     try:
         targets_config = load_targets_config(AGENT_TARGETS_CONFIG_PATH)
         all_devices = fetch_devices(
-            env_values["MONGO_URI"],
-            env_values["MONGO_DB"],
-            env_values["MONGO_COLLECTION"],
-            env_values.get("MONGO_NAME_FIELD") or "sensorName",
-            env_values.get("MONGO_MAC_FIELD") or "macAddress",
+            env_values[PUB_ENV_KEY_MONGO_URI],
+            env_values[PUB_ENV_KEY_MONGO_DB],
+            env_values[PUB_ENV_KEY_MONGO_COLLECTION],
+            env_values.get(PUB_ENV_KEY_MONGO_NAME_FIELD) or MONGO_NAME_FIELD_DEFAULT,
+            env_values.get(PUB_ENV_KEY_MONGO_MAC_FIELD) or MONGO_MAC_FIELD_DEFAULT,
         )
         if not all_devices:
-            sys.exit(f"[error] MongoDB collection '{env_values['MONGO_COLLECTION']}' has no devices")
+            sys.exit(f"[error] MongoDB collection '{env_values[PUB_ENV_KEY_MONGO_COLLECTION]}' has no devices")
         resolved = resolve_targets(targets_config, all_devices)
     except TargetingError as e:
-        _audit("aborted", reason=f"targeting error: {e}")
+        _audit(AUDIT_EVENT_ABORTED, reason=f"targeting error: {e}")
         sys.exit(f"[error] {e}")
 
     manifest_targets = build_manifest_targets(resolved)
     effective_macs = resolved["effective_macs"]
     if not effective_macs:
-        _audit("aborted", reason="empty target set")
+        _audit(AUDIT_EVENT_ABORTED, reason="empty target set")
         sys.exit("[error] Target set is empty, nothing to deploy to.")
 
     # Risk acknowledgement -------------------------------------------------
     print(f"\n[info] Target set ({len(effective_macs)} device(s)):")
     for mac in effective_macs:
         print(f"  - {mac}")
-    print(f"\n[info] Bundle contents:")
+    print("\n[info] Bundle contents:")
     print(f"  - script: {script if script else '(not included)'}")
     print(f"  - agent.env: {env if env else '(not included)'}")
     print(f"  - agent_env_patch.json: {patch if patch else '(not included)'}")
 
     _show_risk_prompt_and_require_phrase()
-    _audit("risk_ack")
+    _audit(AUDIT_EVENT_RISK_ACK)
 
     # Build bundle ---------------------------------------------------------
     with tempfile.TemporaryDirectory(prefix="agent_bundle_") as tmp:
@@ -467,35 +587,38 @@ def main():
         print(f"[info] Archive built: {archive_path.name} ({archive_path.stat().st_size} bytes)")
         print(f"[info] SHA256: {file_hash}")
 
-        if resolved["config_mode"] != "all":
+        if resolved["config_mode"] != TARGETS_CONFIG_MODE_ALL:
             expected_targets = resolved["requested_devices"]
         else:
-            expected_targets = [{"name": m, "mac": m} for m in effective_macs]
-        ack_wait_seconds = int(env_values.get("ACK_WAIT_SECONDS") or DEFAULT_ACK_WAIT_SECONDS)
+            expected_targets = [
+                {EXPECTED_TARGET_KEY_NAME: m, EXPECTED_TARGET_KEY_MAC: m}
+                for m in effective_macs
+            ]
+        ack_wait_seconds = int(env_values.get(PUB_ENV_KEY_ACK_WAIT_SECONDS) or DEFAULT_ACK_WAIT_SECONDS)
 
-        print(f"[info] Publishing to {env_values['MQTT_BROKER']}:{env_values['MQTT_PORT']} topic '{AGENT_OTA_TOPIC}' ...")
+        print(f"[info] Publishing to {env_values[PUB_ENV_KEY_MQTT_BROKER]}:{env_values[PUB_ENV_KEY_MQTT_PORT]} topic '{AGENT_OTA_TOPIC}' ...")
         try:
             result = send_bundle_over_mqtt(
                 archive_path=archive_path,
-                broker=env_values["MQTT_BROKER"],
-                port=int(env_values["MQTT_PORT"]),
-                username=env_values["MQTT_USERNAME"],
-                password=env_values["MQTT_PASSWORD"],
+                broker=env_values[PUB_ENV_KEY_MQTT_BROKER],
+                port=int(env_values[PUB_ENV_KEY_MQTT_PORT]),
+                username=env_values[PUB_ENV_KEY_MQTT_USERNAME],
+                password=env_values[PUB_ENV_KEY_MQTT_PASSWORD],
                 qos=args.qos,
                 chunk_size=args.chunk_size,
                 manifest_targets=manifest_targets,
                 expected_targets=expected_targets,
                 ack_wait_seconds=ack_wait_seconds,
-                reports_dir=SERVER_DIR / "reports",
-                group="ota_agent",
+                reports_dir=SERVER_DIR / REPORTS_DIR_NAME,
+                group=PUBLISH_GROUP_AGENT,
             )
         except Exception as e:
-            _audit("failed", reason=f"{type(e).__name__}: {e}")
+            _audit(AUDIT_EVENT_FAILED, reason=f"{type(e).__name__}: {e}")
             sys.exit(f"[error] MQTT publish failed: {e}")
 
-        write_resolved_file(AGENT_TARGETS_RESOLVED_PATH, "ota_agent", resolved, manifest_targets, archive_path.name)
+        write_resolved_file(AGENT_TARGETS_RESOLVED_PATH, PUBLISH_GROUP_AGENT, resolved, manifest_targets, archive_path.name)
         _audit(
-            "published",
+            AUDIT_EVENT_PUBLISHED,
             session_id=result["session_id"],
             sha256=file_hash,
             target_count=len(effective_macs),

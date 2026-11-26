@@ -42,9 +42,23 @@ BROKER_DB_COLUMN = "staticIp"
 
 EXIT_CODE_CONFIG_ERROR = 1
 
+# Log line prefixes used everywhere so a single grep catches each severity.
+LOG_PREFIX_INFO = "[info]"
+LOG_PREFIX_WARN = "[warn]"
+LOG_PREFIX_ERROR = "[error]"
+
+# Linux network interface used for the device identity MAC. CM4/Pi-based
+# devices expose the on-board Ethernet here.
+ETHERNET_INTERFACE_NAME = "eth0"
+ETHERNET_MAC_SYSFS_PATH = f"/sys/class/net/{ETHERNET_INTERFACE_NAME}/address"
+LINUX_PLATFORM_NAME = "Linux"
+
+# MQTT TLS keepalive used by every client this module opens.
+MQTT_KEEPALIVE_SECS = 60
+
 
 def exit_with_config_error(message: str):
-    print(f"[error] {message}", file=sys.stderr)
+    print(f"{LOG_PREFIX_ERROR} {message}", file=sys.stderr)
     sys.exit(EXIT_CODE_CONFIG_ERROR)
 
 
@@ -70,7 +84,7 @@ def get_broker_from_db(db_path: str):
             return row[0]
         raise RuntimeError(f"No broker address found in {BROKER_DB_TABLE} table")
     except Exception as e:
-        print(f"[error] Failed to fetch MQTT_BROKER from DB ({db_path}): {e}", file=sys.stderr)
+        print(f"{LOG_PREFIX_ERROR} Failed to fetch MQTT_BROKER from DB ({db_path}): {e}", file=sys.stderr)
         sys.exit(EXIT_CODE_CONFIG_ERROR)
 
 
@@ -148,14 +162,24 @@ ACK_QOS = 2
 ACK_STATUS_UPDATED = "updated"
 ACK_STATUS_FAILED = "failed"
 
-# Ack payload discriminator so the server can tell the two pipelines apart.
-ACK_KEY_MODULE = "module"
+# Ack payload keys. Every key on the wire has a named constant so the device
+# and the server-side ack collector stay in lockstep.
+ACK_KEY_MAC = "mac"
+ACK_KEY_STATUS = "status"
+ACK_KEY_MODULE = "module"                           # discriminator: which pipeline
+ACK_KEY_STAGE = "stage"                             # which step failed
+ACK_KEY_REASON = "reason"                           # free-text failure cause
+ACK_KEY_SCRIPT_REPLACED = "script_replaced"         # agent OTA: new ota_agent.py landed
+ACK_KEY_ENV_REPLACED = "env_replaced"               # agent OTA: new agent.env landed
+ACK_KEY_ENV_PATCH_APPLIED = "env_patch_applied"     # agent OTA: agent_env_patch.json ran
+ACK_KEY_ENV_CHANGES = "env_changes"                 # {added, updated, removed} key names
+ACK_KEY_MISSING_ENV_KEYS = "missing_env_keys"       # app OTA: keys in app.env.example not in device app.env
+ACK_KEY_ENV_PATCH = "env_patch"                     # app OTA: env_patch.json status
+ACK_KEY_APP_ENV_CREATED = "app_env_created"         # app OTA: device had no app.env, bundle's used
+ACK_KEY_ENV_RESTORED = "env_restored"               # app OTA: backup put back after failure
+
 ACK_MODULE_APP = "app"               # normal OTA that replaces LIVE_CODE_DIR
 ACK_MODULE_AGENT = "ota_agent"       # agent self-update pipeline
-# Which step of the agent-OTA flow failed. Sent only on failures so the server
-# can group failures by cause.
-ACK_KEY_STAGE = "stage"
-ACK_KEY_REASON = "reason"
 ACK_STAGE_SHA = "sha_mismatch"
 ACK_STAGE_CHUNKS_MISSING = "chunks_missing"
 ACK_STAGE_EXTRACT = "extract"
@@ -186,6 +210,34 @@ TOPIC_SEG_COMPLETE = "complete"
 TOPIC_SEG_CHUNKS = "chunks"
 TOPIC_SEG_META = "meta"
 TOPIC_SEG_DATA = "data"
+TOPIC_SEPARATOR = "/"
+
+# Manifest payload keys the device reads. The publisher writes the same keys.
+MANIFEST_KEY_FILENAME = "filename"
+MANIFEST_KEY_SHA256 = "sha256"
+MANIFEST_KEY_TOTAL_CHUNKS = "total_chunks"
+
+# Per-session bookkeeping keys stored in the `sessions` dict.
+SESSION_KEY_MANIFEST = "manifest"
+SESSION_KEY_CHUNKS = "chunks"
+
+# Keys of the dict returned by apply_env_patch — what changed on disk.
+ENV_CHANGE_ADDED = "added"
+ENV_CHANGE_UPDATED = "updated"
+ENV_CHANGE_REMOVED = "removed"
+
+# Tarfile open modes and file open modes used when staging bundles.
+TAR_READ_GZIP_MODE = "r:gz"
+FILE_WRITE_BINARY_MODE = "wb"
+
+# pm2 CLI arguments. The agent shells out to pm2 to describe and restart
+# services; keeping the executable and verbs as named constants makes it
+# obvious what the subprocess calls actually do.
+PM2_EXECUTABLE = "pm2"
+PM2_DESCRIBE_VERB = "describe"
+PM2_RESTART_VERB = "restart"
+PM2_DESCRIBE_TIMEOUT_SECS = 10
+PM2_RESTART_TIMEOUT_SECS = 30
 
 PM2_SERVICES_TO_RESTART = ("scheduler", "app", "MQTT_Control_Consumer")
 PM2_AGENT_SERVICE = "ota"
@@ -215,10 +267,18 @@ SESSION_KIND_AGENT = "agent"
 AGENT_BUNDLE_SCRIPT = "ota_agent.py"
 AGENT_BUNDLE_ENV = "agent.env"
 AGENT_BUNDLE_ENV_PATCH = "agent_env_patch.json"
+# Shadow copy of the effective agent.env the candidate agent would see on
+# next boot; the selfcheck subprocess points at this file, never at the live
+# agent.env.
+AGENT_ENV_EFFECTIVE_FILE = "agent.env.effective"
 
 AGENT_SCRIPT_PATH = AGENT_DIR / AGENT_BUNDLE_SCRIPT
 AGENT_SCRIPT_BAK = AGENT_SCRIPT_PATH.with_name(AGENT_BUNDLE_SCRIPT + ENV_BACKUP_SUFFIX)
 AGENT_ENV_BAK = AGENT_ENV_PATH.with_name(AGENT_ENV_PATH.name + ENV_BACKUP_SUFFIX)
+
+# File-mode bits for the swapped ota_agent.py. Executable for owner+group,
+# read for everyone (same as the original pm2-managed layout).
+AGENT_SCRIPT_FILE_MODE = 0o755
 
 # Selfcheck: spawn the candidate ota_agent.py with --selfcheck so it validates
 # imports, both env files, and MQTT connectivity before we commit the swap. A
@@ -230,7 +290,22 @@ SELFCHECK_APP_ENV_FLAG = "--selfcheck-app-env"
 SELFCHECK_CLIENT_ID_SUFFIX = "_selfcheck"
 SELFCHECK_TIMEOUT_SECS = 15
 SELFCHECK_CONNECT_TIMEOUT_SECS = 10
+SELFCHECK_MQTT_POLL_INTERVAL_SECS = 0.5
 SELFCHECK_STDERR_MAX_CHARS = 300  # bounds what we put into the failure reason
+
+# Step names used in the `[selfcheck:<step>]` log lines the parent greps.
+SELFCHECK_STEP_IMPORTS = "imports"
+SELFCHECK_STEP_AGENT_ENV = "agent_env"
+SELFCHECK_STEP_APP_ENV = "app_env"
+SELFCHECK_STEP_BROKER_LOOKUP = "broker_lookup"
+SELFCHECK_STEP_MQTT_CONNECT = "mqtt_connect"
+
+# Log tokens emitted by the selfcheck subprocess and picked up by the parent
+# via a startswith() check. Keeping the format in one place guards against
+# drift between the writer and the reader.
+SELFCHECK_LOG_PREFIX = "[selfcheck:"
+SELFCHECK_LOG_STATUS_OK = "ok"
+SELFCHECK_LOG_STATUS_FAIL = "fail"
 
 # Non-zero exit codes from the selfcheck subprocess. The parent maps these to
 # reason strings in the ack so the server sees which check failed.
@@ -254,9 +329,9 @@ def get_ethernet_mac():
     """Get the Ethernet MAC address of the Raspberry Pi"""
     try:
         # For Raspberry Pi/Linux systems
-        if platform.system() == "Linux":
+        if platform.system() == LINUX_PLATFORM_NAME:
             # Try to get eth0 MAC address using subprocess
-            result = subprocess.run(['cat', '/sys/class/net/eth0/address'],
+            result = subprocess.run(['cat', ETHERNET_MAC_SYSFS_PATH],
                                   capture_output=True, text=True)
             if result.returncode == 0:
                 return result.stdout.strip().upper()
@@ -472,31 +547,31 @@ def apply_env_patch(env_path: Path, patch: dict):
         if key:
             key_lines.setdefault(key, []).append(index)
 
-    changes = {"added": [], "updated": [], "removed": []}
+    changes = {ENV_CHANGE_ADDED: [], ENV_CHANGE_UPDATED: [], ENV_CHANGE_REMOVED: []}
 
     for key in patch.get(ENV_PATCH_REMOVE, []):
         for index in key_lines.pop(key, []):
             lines[index] = None
-            if key not in changes["removed"]:
-                changes["removed"].append(key)
+            if key not in changes[ENV_CHANGE_REMOVED]:
+                changes[ENV_CHANGE_REMOVED].append(key)
 
     for key, value in patch.get(ENV_PATCH_SET, {}).items():
         new_line = format_env_line(key, value)
         if key in key_lines:
             if any(lines[index] != new_line for index in key_lines[key]):
-                changes["updated"].append(key)
+                changes[ENV_CHANGE_UPDATED].append(key)
             for index in key_lines[key]:
                 lines[index] = new_line
         else:
             lines.append(new_line)
             key_lines[key] = [len(lines) - 1]
-            changes["added"].append(key)
+            changes[ENV_CHANGE_ADDED].append(key)
 
     for key, value in patch.get(ENV_PATCH_SET_IF_MISSING, {}).items():
         if key not in key_lines:
             lines.append(format_env_line(key, value))
             key_lines[key] = [len(lines) - 1]
-            changes["added"].append(key)
+            changes[ENV_CHANGE_ADDED].append(key)
 
     if not any(changes.values()):
         return None
@@ -518,7 +593,7 @@ def restore_env_backup(env_path: Path) -> bool:
 # Acknowledgement
 # ==============================
 def publish_ack(client, status: str, **details):
-    payload = {"mac": MAC_ADDRESS, "status": status, **details}
+    payload = {ACK_KEY_MAC: MAC_ADDRESS, ACK_KEY_STATUS: status, **details}
     client.publish(ACK_TOPIC, payload=json.dumps(payload), qos=ACK_QOS)
 
 # ==============================
@@ -526,17 +601,17 @@ def publish_ack(client, status: str, **details):
 # ==============================
 def restart_pm2_service():
     try:
-        subprocess.run(["pm2", "restart", *PM2_SERVICES_TO_RESTART], check=True)
-        print(f"[info] PM2 service  restarted successfully.")
+        subprocess.run([PM2_EXECUTABLE, PM2_RESTART_VERB, *PM2_SERVICES_TO_RESTART], check=True)
+        print(f"{LOG_PREFIX_INFO} PM2 services restarted successfully: {', '.join(PM2_SERVICES_TO_RESTART)}")
     except subprocess.CalledProcessError as e:
-        print(f"[error] Failed to restart PM2 service: {e}")
+        print(f"{LOG_PREFIX_ERROR} Failed to restart PM2 service: {e}")
 
 
 def restart_agent_service():
     try:
-        subprocess.run(["pm2", "restart", PM2_AGENT_SERVICE], check=True)
+        subprocess.run([PM2_EXECUTABLE, PM2_RESTART_VERB, PM2_AGENT_SERVICE], check=True)
     except (subprocess.CalledProcessError, OSError) as e:
-        print(f"[error] Failed to restart the agent ({PM2_AGENT_SERVICE}): {e}")
+        print(f"{LOG_PREFIX_ERROR} Failed to restart the agent ({PM2_AGENT_SERVICE}): {e}")
 
 
 def schedule_agent_restart():
@@ -546,7 +621,7 @@ def schedule_agent_restart():
     runs on a timer instead and kills this process once the ack is out.
     """
     threading.Timer(AGENT_RESTART_DELAY_IN_MS / MS_PER_SECOND, restart_agent_service).start()
-    print(f"[info] Agent restart ({PM2_AGENT_SERVICE}) scheduled in {AGENT_RESTART_DELAY_IN_MS} ms.")
+    print(f"{LOG_PREFIX_INFO} Agent restart ({PM2_AGENT_SERVICE}) scheduled in {AGENT_RESTART_DELAY_IN_MS} ms.")
 
 
 def check_pm2_service_reachable(service: str):
@@ -557,8 +632,8 @@ def check_pm2_service_reachable(service: str):
     """
     try:
         result = subprocess.run(
-            ["pm2", "describe", service],
-            capture_output=True, text=True, timeout=10,
+            [PM2_EXECUTABLE, PM2_DESCRIBE_VERB, service],
+            capture_output=True, text=True, timeout=PM2_DESCRIBE_TIMEOUT_SECS,
         )
         if result.returncode != 0:
             return False, f"pm2 describe exit {result.returncode}"
@@ -580,8 +655,8 @@ def schedule_agent_restart_with_failure_ack(client):
     def restart():
         try:
             proc = subprocess.run(
-                ["pm2", "restart", PM2_AGENT_SERVICE],
-                timeout=30, start_new_session=True,
+                [PM2_EXECUTABLE, PM2_RESTART_VERB, PM2_AGENT_SERVICE],
+                timeout=PM2_RESTART_TIMEOUT_SECS, start_new_session=True,
             )
         except (OSError, subprocess.TimeoutExpired) as e:
             reason = f"pm2 restart failed: {type(e).__name__}"
@@ -589,7 +664,7 @@ def schedule_agent_restart_with_failure_ack(client):
             if proc.returncode <= 0:
                 return
             reason = f"pm2 restart exit {proc.returncode}"
-        print(f"[error] {reason}")
+        print(f"{LOG_PREFIX_ERROR} {reason}")
         publish_ack(
             client, ACK_STATUS_FAILED,
             **{
@@ -599,7 +674,7 @@ def schedule_agent_restart_with_failure_ack(client):
             },
         )
     threading.Timer(AGENT_RESTART_DELAY_IN_MS / MS_PER_SECOND, restart).start()
-    print(f"[info] Agent restart ({PM2_AGENT_SERVICE}) scheduled in {AGENT_RESTART_DELAY_IN_MS} ms.")
+    print(f"{LOG_PREFIX_INFO} Agent restart ({PM2_AGENT_SERVICE}) scheduled in {AGENT_RESTART_DELAY_IN_MS} ms.")
 
 
 # ==============================
@@ -624,9 +699,9 @@ def prune_agent_backups():
         if bak.is_file():
             try:
                 bak.unlink()
-                print(f"[info] Removed stale backup {bak.name}")
+                print(f"{LOG_PREFIX_INFO} Removed stale backup {bak.name}")
             except OSError as e:
-                print(f"[warn] Could not remove stale backup {bak}: {e}")
+                print(f"{LOG_PREFIX_WARN} Could not remove stale backup {bak}: {e}")
 
 
 def load_agent_env_patch(patch_path: Path):
@@ -664,7 +739,7 @@ def materialise_effective_agent_env(staging: Path, new_env: Path, env_patch, has
     bundle's. Patch -> apply the patch to a shadow of the current file. No
     change -> a copy of the current file.
     """
-    effective = staging / "agent.env.effective"
+    effective = staging / AGENT_ENV_EFFECTIVE_FILE
     if has_env:
         shutil.copyfile(new_env, effective)
     else:
@@ -695,7 +770,7 @@ def _selfcheck_reason_from(exit_code: int, stderr_tail: str) -> str:
     base = mapping.get(exit_code, f"selfcheck exit {exit_code}")
     tail = ""
     for line in reversed(stderr_tail.splitlines()):
-        if line.startswith("[selfcheck:"):
+        if line.startswith(SELFCHECK_LOG_PREFIX):
             tail = line.strip()
             break
     return f"{base} ({tail})" if tail else base
@@ -729,7 +804,7 @@ def swap_agent_script(new_script: Path):
     shutil.copy2(AGENT_SCRIPT_PATH, AGENT_SCRIPT_BAK)
     tmp = AGENT_SCRIPT_PATH.with_name(AGENT_SCRIPT_PATH.name + ENV_TMP_SUFFIX)
     tmp.write_bytes(new_script.read_bytes())
-    os.chmod(tmp, 0o755)
+    os.chmod(tmp, AGENT_SCRIPT_FILE_MODE)
     os.replace(tmp, AGENT_SCRIPT_PATH)
 
 
@@ -745,12 +820,12 @@ def restore_agent_backups(script_was_swapped: bool, env_was_swapped: bool):
         try:
             os.replace(AGENT_SCRIPT_BAK, AGENT_SCRIPT_PATH)
         except OSError as e:
-            print(f"[error] Could not restore ota_agent.py from backup: {e}")
+            print(f"{LOG_PREFIX_ERROR} Could not restore ota_agent.py from backup: {e}")
     if env_was_swapped and AGENT_ENV_BAK.is_file():
         try:
             os.replace(AGENT_ENV_BAK, AGENT_ENV_PATH)
         except OSError as e:
-            print(f"[error] Could not restore agent.env from backup: {e}")
+            print(f"{LOG_PREFIX_ERROR} Could not restore agent.env from backup: {e}")
 
 
 def handle_agent_ota_complete(client, session_id: str):
@@ -764,19 +839,21 @@ def handle_agent_ota_complete(client, session_id: str):
     sess = sessions.get(session_id)
     if not sess:
         return
-    manifest = sess["manifest"]
+    manifest = sess[SESSION_KEY_MANIFEST]
+    chunks = sess[SESSION_KEY_CHUNKS]
+    total_chunks = manifest[MANIFEST_KEY_TOTAL_CHUNKS]
 
-    if len(sess["chunks"]) != manifest["total_chunks"]:
+    if len(chunks) != total_chunks:
         publish_agent_ack_failed(
             client, ACK_STAGE_CHUNKS_MISSING,
-            f"missing chunks: {len(sess['chunks'])}/{manifest['total_chunks']}",
+            f"missing chunks: {len(chunks)}/{total_chunks}",
         )
         reset_session(session_id)
         return
 
-    file_bytes = b"".join(sess["chunks"][i] for i in range(manifest["total_chunks"]))
+    file_bytes = b"".join(chunks[i] for i in range(total_chunks))
     sha = hashlib.sha256(file_bytes).hexdigest()
-    if sha != manifest["sha256"]:
+    if sha != manifest[MANIFEST_KEY_SHA256]:
         publish_agent_ack_failed(client, ACK_STAGE_SHA, "sha256 mismatch")
         reset_session(session_id)
         return
@@ -785,9 +862,9 @@ def handle_agent_ota_complete(client, session_id: str):
         if AGENT_OTA_STAGING_DIR.exists():
             shutil.rmtree(AGENT_OTA_STAGING_DIR)
         AGENT_OTA_STAGING_DIR.mkdir(parents=True)
-        tar_file = AGENT_OTA_STAGING_DIR / manifest["filename"]
+        tar_file = AGENT_OTA_STAGING_DIR / manifest[MANIFEST_KEY_FILENAME]
         tar_file.write_bytes(file_bytes)
-        with tarfile.open(tar_file, "r:gz") as tar:
+        with tarfile.open(tar_file, TAR_READ_GZIP_MODE) as tar:
             safe_extract(tar, AGENT_OTA_STAGING_DIR)
     except Exception as e:
         publish_agent_ack_failed(client, ACK_STAGE_EXTRACT, f"extract failed: {type(e).__name__}: {e}")
@@ -889,10 +966,10 @@ def handle_agent_ota_complete(client, session_id: str):
         client, ACK_STATUS_UPDATED,
         **{
             ACK_KEY_MODULE: ACK_MODULE_AGENT,
-            "script_replaced": has_script,
-            "env_replaced": has_env,
-            "env_patch_applied": has_env_patch,
-            "env_changes": env_patch_changes,
+            ACK_KEY_SCRIPT_REPLACED: has_script,
+            ACK_KEY_ENV_REPLACED: has_env,
+            ACK_KEY_ENV_PATCH_APPLIED: has_env_patch,
+            ACK_KEY_ENV_CHANGES: env_patch_changes,
         },
     )
 
@@ -912,23 +989,24 @@ def _selfcheck_log(step: str, ok: bool, detail: str = ""):
     without the risk of pulling a credential value out of a random stderr line.
     """
     stream = sys.stdout if ok else sys.stderr
-    status = "ok" if ok else "fail"
-    message = f"[selfcheck:{step}] {status}"
+    status = SELFCHECK_LOG_STATUS_OK if ok else SELFCHECK_LOG_STATUS_FAIL
+    message = f"{SELFCHECK_LOG_PREFIX}{step}] {status}"
     if detail:
         message = f"{message} {detail}"
     print(message, file=stream, flush=True)
 
 
-def _selfcheck_env(step: str, env_path: Path, required_keys) -> int:
+def _selfcheck_env(step: str, env_path: Path, required_keys,
+                   exit_missing: int, exit_invalid: int) -> int:
     """Return 0 when env_path exists and defines every required key with a non-empty value."""
     if not env_path.is_file():
         _selfcheck_log(step, False, f"file missing: {env_path}")
-        return SELFCHECK_EXIT_AGENT_ENV_MISSING if step == "agent_env" else SELFCHECK_EXIT_APP_ENV_MISSING
+        return exit_missing
     values = dotenv_values(env_path)
     missing = [key for key in required_keys if not values.get(key)]
     if missing:
         _selfcheck_log(step, False, f"missing keys: {','.join(missing)}")
-        return SELFCHECK_EXIT_AGENT_ENV_INVALID if step == "agent_env" else SELFCHECK_EXIT_APP_ENV_INVALID
+        return exit_invalid
     _selfcheck_log(step, True)
     return SELFCHECK_EXIT_OK
 
@@ -949,15 +1027,15 @@ def _selfcheck_mqtt_connect(broker: str, port: int, user: str, password: str, cl
         client.tls_insecure_set(True)
         client.connect(broker, port)
     except Exception as e:
-        _selfcheck_log("mqtt_connect", False, f"setup error: {type(e).__name__}")
+        _selfcheck_log(SELFCHECK_STEP_MQTT_CONNECT, False, f"setup error: {type(e).__name__}")
         return SELFCHECK_EXIT_MQTT_ERROR
 
     deadline = time.time() + SELFCHECK_CONNECT_TIMEOUT_SECS
     while time.time() < deadline and not state["connected"]:
-        client.loop(timeout=0.5)
+        client.loop(timeout=SELFCHECK_MQTT_POLL_INTERVAL_SECS)
 
     if not state["connected"]:
-        _selfcheck_log("mqtt_connect", False, f"not connected, rc={state['rc']}")
+        _selfcheck_log(SELFCHECK_STEP_MQTT_CONNECT, False, f"not connected, rc={state['rc']}")
         try:
             client.disconnect()
         except Exception:
@@ -968,7 +1046,7 @@ def _selfcheck_mqtt_connect(broker: str, port: int, user: str, password: str, cl
         client.disconnect()
     except Exception:
         pass
-    _selfcheck_log("mqtt_connect", True)
+    _selfcheck_log(SELFCHECK_STEP_MQTT_CONNECT, True)
     return SELFCHECK_EXIT_OK
 
 
@@ -985,15 +1063,21 @@ def run_selfcheck(argv) -> int:
     args, _ = parser.parse_known_args(argv[1:])
 
     # Imports reaching this point means every top-of-file import resolved.
-    _selfcheck_log("imports", True)
+    _selfcheck_log(SELFCHECK_STEP_IMPORTS, True)
 
     agent_env_path = Path(args.agent_env)
     app_env_path = Path(args.app_env)
 
-    rc = _selfcheck_env("agent_env", agent_env_path, AGENT_ENV_REQUIRED_KEYS)
+    rc = _selfcheck_env(
+        SELFCHECK_STEP_AGENT_ENV, agent_env_path, AGENT_ENV_REQUIRED_KEYS,
+        SELFCHECK_EXIT_AGENT_ENV_MISSING, SELFCHECK_EXIT_AGENT_ENV_INVALID,
+    )
     if rc != SELFCHECK_EXIT_OK:
         return rc
-    rc = _selfcheck_env("app_env", app_env_path, APP_ENV_REQUIRED_KEYS)
+    rc = _selfcheck_env(
+        SELFCHECK_STEP_APP_ENV, app_env_path, APP_ENV_REQUIRED_KEYS,
+        SELFCHECK_EXIT_APP_ENV_MISSING, SELFCHECK_EXIT_APP_ENV_INVALID,
+    )
     if rc != SELFCHECK_EXIT_OK:
         return rc
 
@@ -1001,14 +1085,15 @@ def run_selfcheck(argv) -> int:
     agent_values = dotenv_values(agent_env_path)
     broker_db_path = agent_values.get(ENV_KEY_BROKER_DB_PATH)
     if not broker_db_path:
-        _selfcheck_log("broker_lookup", False, f"{ENV_KEY_BROKER_DB_PATH} not set in agent.env")
+        _selfcheck_log(SELFCHECK_STEP_BROKER_LOOKUP, False,
+                       f"{ENV_KEY_BROKER_DB_PATH} not set in agent.env")
         return SELFCHECK_EXIT_BROKER_LOOKUP
     try:
         broker = get_broker_from_db(broker_db_path)
     except SystemExit:
-        _selfcheck_log("broker_lookup", False, "db lookup failed")
+        _selfcheck_log(SELFCHECK_STEP_BROKER_LOOKUP, False, "db lookup failed")
         return SELFCHECK_EXIT_BROKER_LOOKUP
-    _selfcheck_log("broker_lookup", True)
+    _selfcheck_log(SELFCHECK_STEP_BROKER_LOOKUP, True)
 
     port = int(app_values[ENV_KEY_MQTT_PORT])
     user = app_values[ENV_KEY_MQTT_USERNAME]
@@ -1026,7 +1111,7 @@ def reset_session(session_id: str):
     skipped_sessions.discard(session_id)
 
 def on_connect(client, userdata, flags, rc, properties=None):
-    print("[info] Connected with result code", rc)
+    print(f"{LOG_PREFIX_INFO} Connected with result code", rc)
     for root in (TOPIC, AGENT_OTA_TOPIC):
         client.subscribe(f"{root}/+/{TOPIC_SEG_MANIFEST}")
         client.subscribe(f"{root}/+/{TOPIC_SEG_CHUNKS}/{TOPIC_SEG_META}/+")
@@ -1041,13 +1126,13 @@ def on_message(client, userdata, msg):
     # The root picks the pipeline (TOPIC -> normal app OTA, AGENT_OTA_TOPIC
     # -> agent self-update). Session id is the segment right above the suffix:
     # one back for manifest/complete, three back for chunks.
-    if msg.topic.startswith(AGENT_OTA_TOPIC + "/"):
+    if msg.topic.startswith(AGENT_OTA_TOPIC + TOPIC_SEPARATOR):
         kind = SESSION_KIND_AGENT
-    elif msg.topic.startswith(TOPIC + "/"):
+    elif msg.topic.startswith(TOPIC + TOPIC_SEPARATOR):
         kind = SESSION_KIND_APP
     else:
         return
-    topic_parts = msg.topic.split('/')
+    topic_parts = msg.topic.split(TOPIC_SEPARATOR)
 
     if topic_parts[-1] in (TOPIC_SEG_MANIFEST, TOPIC_SEG_COMPLETE) and len(topic_parts) >= 2:
         session_id = topic_parts[-2]
@@ -1060,10 +1145,10 @@ def on_message(client, userdata, msg):
         try:
             manifest = json.loads(msg.payload.decode())
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            print(f"[warn] Dropping malformed manifest on {msg.topic}: {e}")
+            print(f"{LOG_PREFIX_WARN} Dropping malformed manifest on {msg.topic}: {e}")
             return
         if not is_session_targeted(manifest.get(MANIFEST_KEY_TARGETS), MAC_ADDRESS):
-            print(f"[info] Session {session_id} does not target this device, skipping")
+            print(f"{LOG_PREFIX_INFO} Session {session_id} does not target this device, skipping")
             skipped_sessions.add(session_id)
             return
         # Agent-OTA refuses to start while any other session is in flight: a
@@ -1071,7 +1156,7 @@ def on_message(client, userdata, msg):
         # self-update loses (publisher will retry).
         if kind == SESSION_KIND_AGENT and sessions:
             other = next(iter(sessions.values()))
-            print(f"[warn] Agent-OTA manifest arrived while {other.get(SESSION_KIND_KEY)} session is active, rejecting")
+            print(f"{LOG_PREFIX_WARN} Agent-OTA manifest arrived while {other.get(SESSION_KIND_KEY)} session is active, rejecting")
             publish_agent_ack_failed(
                 client, ACK_STAGE_CONCURRENCY,
                 f"another session in progress ({other.get(SESSION_KIND_KEY)})",
@@ -1085,20 +1170,20 @@ def on_message(client, userdata, msg):
         if kind == SESSION_KIND_APP and sessions:
             active_ids = [sid for sid in sessions if sid != session_id]
             if active_ids:
-                print(f"[warn] App-OTA manifest {session_id} arrived while session(s) {active_ids} are still in flight; last to complete wins")
+                print(f"{LOG_PREFIX_WARN} App-OTA manifest {session_id} arrived while session(s) {active_ids} are still in flight; last to complete wins")
         sessions[session_id] = {
-            "manifest": manifest,
-            "chunks": {},
+            SESSION_KEY_MANIFEST: manifest,
+            SESSION_KEY_CHUNKS: {},
             SESSION_KIND_KEY: kind,
         }
-        print(f"[info] New {kind} session {session_id}, expecting {manifest['total_chunks']} chunks")
+        print(f"{LOG_PREFIX_INFO} New {kind} session {session_id}, expecting {manifest[MANIFEST_KEY_TOTAL_CHUNKS]} chunks")
 
     elif TOPIC_SEG_CHUNKS in topic_parts and topic_parts[-2] == TOPIC_SEG_DATA:
         if session_id not in sessions:
             return
         index = int(topic_parts[-1])
-        sessions[session_id]["chunks"][index] = msg.payload
-        print(f"[info] Got chunk {index} for {session_id} ({len(msg.payload)} bytes)")
+        sessions[session_id][SESSION_KEY_CHUNKS][index] = msg.payload
+        print(f"{LOG_PREFIX_INFO} Got chunk {index} for {session_id} ({len(msg.payload)} bytes)")
 
     elif topic_parts[-1] == TOPIC_SEG_COMPLETE:
         if session_id in skipped_sessions:
@@ -1107,47 +1192,48 @@ def on_message(client, userdata, msg):
         try:
             json.loads(msg.payload.decode())
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            print(f"[warn] Dropping malformed complete on {msg.topic}: {e}")
+            print(f"{LOG_PREFIX_WARN} Dropping malformed complete on {msg.topic}: {e}")
             reset_session(session_id)
             return
         if session_id not in sessions:
-            print("[warn] Complete for unknown session")
+            print(f"{LOG_PREFIX_WARN} Complete for unknown session")
             return
         if sessions[session_id].get(SESSION_KIND_KEY) == SESSION_KIND_AGENT:
             handle_agent_ota_complete(client, session_id)
             return
         session = sessions[session_id]
-        manifest = session["manifest"]
-        received_chunks = session["chunks"]
+        manifest = session[SESSION_KEY_MANIFEST]
+        received_chunks = session[SESSION_KEY_CHUNKS]
+        total_chunks = manifest[MANIFEST_KEY_TOTAL_CHUNKS]
 
-        if len(received_chunks) != manifest["total_chunks"]:
-            print(f"[warn] Missing chunks: {len(received_chunks)}/{manifest['total_chunks']}")
+        if len(received_chunks) != total_chunks:
+            print(f"{LOG_PREFIX_WARN} Missing chunks: {len(received_chunks)}/{total_chunks}")
             reset_session(session_id)
             return
 
-        file_bytes = b''.join(received_chunks[i] for i in range(manifest["total_chunks"]))
+        file_bytes = b''.join(received_chunks[i] for i in range(total_chunks))
 
         sha = hashlib.sha256(file_bytes).hexdigest()
-        if sha != manifest["sha256"]:
-            print("[error] SHA256 mismatch! Aborting deployment.")
+        if sha != manifest[MANIFEST_KEY_SHA256]:
+            print(f"{LOG_PREFIX_ERROR} SHA256 mismatch! Aborting deployment.")
             reset_session(session_id)
             return
-        print("[info] SHA256 verified OK.")
+        print(f"{LOG_PREFIX_INFO} SHA256 verified OK.")
 
         # Prepare staging directory
         if STAGING_DIR.exists():
             shutil.rmtree(STAGING_DIR)
         STAGING_DIR.mkdir(parents=True)
 
-        tar_file = STAGING_DIR / manifest["filename"]
-        with open(tar_file, "wb") as f:
+        tar_file = STAGING_DIR / manifest[MANIFEST_KEY_FILENAME]
+        with open(tar_file, FILE_WRITE_BINARY_MODE) as f:
             f.write(file_bytes)
-        print(f"[info] Saved OTA tarball to {tar_file}")
+        print(f"{LOG_PREFIX_INFO} Saved OTA tarball to {tar_file}")
 
         # Extract safely into staging
-        with tarfile.open(tar_file, "r:gz") as tar:
+        with tarfile.open(tar_file, TAR_READ_GZIP_MODE) as tar:
             safe_extract(tar, STAGING_DIR)
-        print(f"[info] Extracted into staging: {STAGING_DIR}")
+        print(f"{LOG_PREFIX_INFO} Extracted into staging: {STAGING_DIR}")
 
         # Check that an app.env will exist and that the bundle's env patch is valid before touching anything
         device_env = LIVE_CODE_DIR / DEVICE_ENV_FILE
@@ -1155,7 +1241,7 @@ def on_message(client, userdata, msg):
             require_app_env_source(STAGING_DIR, LIVE_CODE_DIR)
             env_patch = load_env_patch(STAGING_DIR)
         except (RuntimeError, ValueError) as e:
-            print(f"[error] {e}. The current code keeps running.")
+            print(f"{LOG_PREFIX_ERROR} {e}. The current code keeps running.")
             publish_ack(client, ACK_STATUS_FAILED,
                         **{ACK_KEY_MODULE: ACK_MODULE_APP, ACK_KEY_REASON: str(e)})
             reset_session(session_id)
@@ -1171,22 +1257,22 @@ def on_message(client, userdata, msg):
                 LIVE_CODE_DIR.mkdir(parents=True, exist_ok=True)
                 create_app_env_from_bundle(STAGING_DIR / DEVICE_ENV_FILE, device_env)
             except OSError as e:
-                print(f"[error] Could not create {DEVICE_ENV_FILE}: {e}. The current code keeps running.")
+                print(f"{LOG_PREFIX_ERROR} Could not create {DEVICE_ENV_FILE}: {e}. The current code keeps running.")
                 publish_ack(client, ACK_STATUS_FAILED,
                             **{ACK_KEY_MODULE: ACK_MODULE_APP,
                                ACK_KEY_REASON: f"{DEVICE_ENV_FILE} not created: {e}"})
                 reset_session(session_id)
                 return
-            print(f"[info] {DEVICE_ENV_FILE} created from the bundle")
+            print(f"{LOG_PREFIX_INFO} {DEVICE_ENV_FILE} created from the bundle")
             if env_patch is not None:
                 env_patch_status = ENV_PATCH_STATUS_SKIPPED_ENV_CREATED
-                print(f"[info] {ENV_PATCH_FILE} skipped, {DEVICE_ENV_FILE} was just created")
+                print(f"{LOG_PREFIX_INFO} {ENV_PATCH_FILE} skipped, {DEVICE_ENV_FILE} was just created")
         elif env_patch is not None:
             if is_env_patch_targeted(env_patch, MAC_ADDRESS):
                 try:
                     env_changes = apply_env_patch(device_env, env_patch)
                 except OSError as e:
-                    print(f"[error] Could not apply {ENV_PATCH_FILE}: {e}. The current code keeps running.")
+                    print(f"{LOG_PREFIX_ERROR} Could not apply {ENV_PATCH_FILE}: {e}. The current code keeps running.")
                     publish_ack(client, ACK_STATUS_FAILED,
                                 **{ACK_KEY_MODULE: ACK_MODULE_APP,
                                    ACK_KEY_REASON: f"{ENV_PATCH_FILE} not applied: {e}"})
@@ -1194,17 +1280,19 @@ def on_message(client, userdata, msg):
                     return
                 env_patch_status = ENV_PATCH_STATUS_APPLIED
                 if env_changes is not None:
-                    print(f"[info] {ENV_PATCH_FILE} applied to {DEVICE_ENV_FILE}: "
-                          f"added={env_changes['added']} updated={env_changes['updated']} removed={env_changes['removed']}")
+                    print(f"{LOG_PREFIX_INFO} {ENV_PATCH_FILE} applied to {DEVICE_ENV_FILE}: "
+                          f"{ENV_CHANGE_ADDED}={env_changes[ENV_CHANGE_ADDED]} "
+                          f"{ENV_CHANGE_UPDATED}={env_changes[ENV_CHANGE_UPDATED]} "
+                          f"{ENV_CHANGE_REMOVED}={env_changes[ENV_CHANGE_REMOVED]}")
                 else:
-                    print(f"[info] {ENV_PATCH_FILE} applied to {DEVICE_ENV_FILE}: no changes")
+                    print(f"{LOG_PREFIX_INFO} {ENV_PATCH_FILE} applied to {DEVICE_ENV_FILE}: no changes")
             else:
                 env_patch_status = ENV_PATCH_STATUS_NOT_TARGETED
-                print(f"[info] {ENV_PATCH_FILE} does not target this device, {DEVICE_ENV_FILE} unchanged")
+                print(f"{LOG_PREFIX_INFO} {ENV_PATCH_FILE} does not target this device, {DEVICE_ENV_FILE} unchanged")
 
         missing_env_keys = find_missing_env_keys(STAGING_DIR, device_env)
         if missing_env_keys:
-            print(f"[warn] Device {DEVICE_ENV_FILE} lacks keys listed in {EXAMPLE_ENV_FILE}, "
+            print(f"{LOG_PREFIX_WARN} Device {DEVICE_ENV_FILE} lacks keys listed in {EXAMPLE_ENV_FILE}, "
                   f"the code defaults will be used: {', '.join(missing_env_keys)}")
 
         # Replace live code; put the old app.env back (or remove the new one) if that fails
@@ -1214,20 +1302,21 @@ def on_message(client, userdata, msg):
             if app_env_created:
                 device_env.unlink(missing_ok=True)
             env_restored = env_changes is not None and restore_env_backup(device_env)
-            print(f"[error] Replacing the live code failed: {e}"
+            print(f"{LOG_PREFIX_ERROR} Replacing the live code failed: {e}"
                   f"{f' ({DEVICE_ENV_FILE} restored from backup)' if env_restored else ''}")
             publish_ack(client, ACK_STATUS_FAILED,
                         **{ACK_KEY_MODULE: ACK_MODULE_APP,
                            ACK_KEY_REASON: f"replace failed: {e}"},
-                        env_restored=env_restored)
+                        **{ACK_KEY_ENV_RESTORED: env_restored})
             reset_session(session_id)
             return
 
         publish_ack(client, ACK_STATUS_UPDATED,
-                    **{ACK_KEY_MODULE: ACK_MODULE_APP},
-                    missing_env_keys=missing_env_keys,
-                    env_patch=env_patch_status, env_changes=env_changes,
-                    app_env_created=app_env_created)
+                    **{ACK_KEY_MODULE: ACK_MODULE_APP,
+                       ACK_KEY_MISSING_ENV_KEYS: missing_env_keys,
+                       ACK_KEY_ENV_PATCH: env_patch_status,
+                       ACK_KEY_ENV_CHANGES: env_changes,
+                       ACK_KEY_APP_ENV_CREATED: app_env_created})
 
         reset_session(session_id)
 
@@ -1266,9 +1355,9 @@ if __name__ == "__main__":
     try:
         client.tls_set(cert_reqs=paho.ssl.CERT_NONE)
         client.tls_insecure_set(True)
-        client.connect(BROKER, int(PORT))
+        client.connect(BROKER, int(PORT), keepalive=MQTT_KEEPALIVE_SECS)
     except Exception as e:
-        print(f"[error] MQTT connect failed: {e}", file=sys.stderr)
+        print(f"{LOG_PREFIX_ERROR} MQTT connect failed: {e}", file=sys.stderr)
         traceback.print_exc()
         sys.exit(EXIT_CODE_CONFIG_ERROR)
 
@@ -1279,6 +1368,6 @@ if __name__ == "__main__":
     try:
         client.loop_forever()
     except KeyboardInterrupt:
-        print("[info] Shutting down on signal.")
+        print(f"{LOG_PREFIX_INFO} Shutting down on signal.")
     finally:
         client.disconnect()
