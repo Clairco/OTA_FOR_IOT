@@ -43,7 +43,7 @@ server/ota_publisher_*.py ──► ota/updates/<target>/... ──► device/ot
 1. Set `REPO_PATHS` in `server/publisher.env` to the code folder you want to ship.
 2. Pick which devices in the group this push goes to — see [Selective delivery](#selective-delivery-adding-devices-and-picking-a-mode) below.
 3. Run `python3 server/ota_publisher_thermopile.py` (or the PCS one). The thermopile publisher queries MongoDB, prints the plan (group size, mode, device list, effective target count), and asks for confirmation before building the archive or opening MQTT. Type `y` or `yes` to proceed.
-4. Each targeted device replies on `OTA/ack` with `{"mac_Id": ..., "status": "updated"}`. Non-targeted devices in the group see the manifest, log that they aren't targeted, and ignore the chunks.
+4. Each targeted device replies on `OTA/ack` with `{"mac": ..., "status": "updated"}`. Non-targeted devices in the group see the manifest, log that they aren't targeted, and ignore the chunks.
 5. The resolved target list (what the publisher actually sent) is written to `server/targets.resolved.json` as an audit record.
 
 ### Selective delivery: adding devices and picking a mode
