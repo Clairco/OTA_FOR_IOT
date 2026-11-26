@@ -137,6 +137,25 @@ ACK_QOS = 2
 ACK_STATUS_UPDATED = "updated"
 ACK_STATUS_FAILED = "failed"
 
+# Manifest 'targets' block: lets the publisher deploy to a subset of the group.
+#   {"mode": "all"}                            -> everyone in the group
+#   {"mode": "include", "mac": ["AA:BB:..."]}  -> only these devices
+#   {"mode": "exclude", "mac": ["AA:BB:..."]}  -> everyone except these
+# A missing 'targets' block means "all" (older publishers).
+MANIFEST_KEY_TARGETS = "targets"
+TARGETS_KEY_MODE = "mode"
+TARGETS_KEY_MAC = "mac"
+TARGETS_MODE_ALL = "all"
+TARGETS_MODE_INCLUDE = "include"
+TARGETS_MODE_EXCLUDE = "exclude"
+
+# MQTT topic segments: <TOPIC>/<session_id>/<segment>[/<data|meta>/<index>]
+TOPIC_SEG_MANIFEST = "manifest"
+TOPIC_SEG_COMPLETE = "complete"
+TOPIC_SEG_CHUNKS = "chunks"
+TOPIC_SEG_META = "meta"
+TOPIC_SEG_DATA = "data"
+
 PM2_SERVICES_TO_RESTART = ("scheduler", "app", "MQTT_Control_Consumer")
 PM2_AGENT_SERVICE = "ota"
 # Restarting the agent kills this process, so it waits for the ack to go out first.
@@ -144,6 +163,7 @@ AGENT_RESTART_DELAY_IN_MS = 3000
 MS_PER_SECOND = 1000
 
 sessions = {}
+skipped_sessions = set()
 
 # =============================
 # get mac address
@@ -315,6 +335,36 @@ def is_env_patch_targeted(patch: dict, device_mac: str) -> bool:
     return str(device_mac).lower() in {mac.lower() for mac in macs}
 
 
+def is_session_targeted(targets, device_mac: str) -> bool:
+    """
+    True when the manifest's 'targets' block includes this device.
+
+    A missing block (None) means every device, for backwards compatibility
+    with older publishers. Any other shape — non-dict, missing mode key, or
+    unknown mode value — fails closed so a malformed manifest never installs
+    on anything.
+    """
+    if targets is None:
+        return True
+    if not isinstance(targets, dict):
+        return False
+    if TARGETS_KEY_MODE not in targets:
+        return False
+    mode = targets[TARGETS_KEY_MODE]
+    if mode == TARGETS_MODE_ALL:
+        return True
+    mac_list = targets.get(TARGETS_KEY_MAC, [])
+    if not isinstance(mac_list, list):
+        return False
+    mac_set = {str(mac).lower() for mac in mac_list}
+    device_mac_lower = str(device_mac).lower()
+    if mode == TARGETS_MODE_INCLUDE:
+        return device_mac_lower in mac_set
+    if mode == TARGETS_MODE_EXCLUDE:
+        return device_mac_lower not in mac_set
+    return False
+
+
 def format_env_line(key: str, value: str) -> str:
     if any(char in ENV_CHARS_NEEDING_QUOTES for char in value):
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
@@ -384,7 +434,7 @@ def restore_env_backup(env_path: Path) -> bool:
 # Acknowledgement
 # ==============================
 def publish_ack(client, status: str, **details):
-    payload = {"mac_Id": MAC_ADDRESS, "status": status, **details}
+    payload = {"mac": MAC_ADDRESS, "status": status, **details}
     client.publish(ACK_TOPIC, payload=json.dumps(payload), qos=ACK_QOS)
 
 # ==============================
@@ -419,50 +469,72 @@ def schedule_agent_restart():
 # ==============================
 def reset_session(session_id: str):
     sessions.pop(session_id, None)
+    skipped_sessions.discard(session_id)
 
 def on_connect(client, userdata, flags, rc, properties=None):
     print("[info] Connected with result code", rc)
-    client.subscribe(f"{TOPIC}/+/manifest")
-    client.subscribe(f"{TOPIC}/+/chunks/meta/+")
-    client.subscribe(f"{TOPIC}/+/chunks/data/+")
-    client.subscribe(f"{TOPIC}/+/complete")
+    client.subscribe(f"{TOPIC}/+/{TOPIC_SEG_MANIFEST}")
+    client.subscribe(f"{TOPIC}/+/{TOPIC_SEG_CHUNKS}/{TOPIC_SEG_META}/+")
+    client.subscribe(f"{TOPIC}/+/{TOPIC_SEG_CHUNKS}/{TOPIC_SEG_DATA}/+")
+    client.subscribe(f"{TOPIC}/+/{TOPIC_SEG_COMPLETE}")
 
 def on_message(client, userdata, msg):
     topic_parts = msg.topic.split('/')
-    if len(topic_parts) < 3:
+    # Topic layouts (session_id is a UUID from the publisher):
+    #   <TOPIC>/<session_id>/manifest
+    #   <TOPIC>/<session_id>/complete
+    #   <TOPIC>/<session_id>/chunks/<meta|data>/<index>
+    # Session id is the segment right above the suffix: one back for
+    # manifest/complete, three back for chunks.
+    if topic_parts[-1] in (TOPIC_SEG_MANIFEST, TOPIC_SEG_COMPLETE) and len(topic_parts) >= 2:
+        session_id = topic_parts[-2]
+    elif len(topic_parts) >= 4 and topic_parts[-3] == TOPIC_SEG_CHUNKS:
+        session_id = topic_parts[-4]
+    else:
         return
-    session_id = topic_parts[2]
 
-    if topic_parts[-1] == "manifest":
+    if topic_parts[-1] == TOPIC_SEG_MANIFEST:
         manifest = json.loads(msg.payload.decode())
+        if not is_session_targeted(manifest.get(MANIFEST_KEY_TARGETS), MAC_ADDRESS):
+            print(f"[info] Session {session_id} does not target this device, skipping")
+            skipped_sessions.add(session_id)
+            return
         sessions[session_id] = {
             "manifest": manifest,
             "chunks": {},
         }
         print(f"[info] New session {session_id}, expecting {manifest['total_chunks']} chunks")
 
-    elif "chunks" in topic_parts and topic_parts[-2] == "data":
+    elif TOPIC_SEG_CHUNKS in topic_parts and topic_parts[-2] == TOPIC_SEG_DATA:
+        if session_id not in sessions:
+            return
         index = int(topic_parts[-1])
         sessions[session_id]["chunks"][index] = msg.payload
         print(f"[info] Got chunk {index} for {session_id} ({len(msg.payload)} bytes)")
 
-    elif topic_parts[-1] == "complete":
+    elif topic_parts[-1] == TOPIC_SEG_COMPLETE:
+        if session_id in skipped_sessions:
+            skipped_sessions.discard(session_id)
+            return
         complete = json.loads(msg.payload.decode())
         if session_id not in sessions:
             print("[warn] Complete for unknown session")
             return
-        sess = sessions[session_id]
-        manifest = sess["manifest"]
+        session = sessions[session_id]
+        manifest = session["manifest"]
+        received_chunks = session["chunks"]
 
-        if len(sess["chunks"]) != manifest["total_chunks"]:
-            print(f"[warn] Missing chunks: {len(sess['chunks'])}/{manifest['total_chunks']}")
+        if len(received_chunks) != manifest["total_chunks"]:
+            print(f"[warn] Missing chunks: {len(received_chunks)}/{manifest['total_chunks']}")
+            reset_session(session_id)
             return
 
-        file_bytes = b''.join(sess["chunks"][i] for i in range(manifest["total_chunks"]))
+        file_bytes = b''.join(received_chunks[i] for i in range(manifest["total_chunks"]))
 
         sha = hashlib.sha256(file_bytes).hexdigest()
         if sha != manifest["sha256"]:
             print("[error] SHA256 mismatch! Aborting deployment.")
+            reset_session(session_id)
             return
         print("[info] SHA256 verified OK.")
 

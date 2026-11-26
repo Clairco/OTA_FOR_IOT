@@ -1,0 +1,9 @@
+{
+  "_help": "Copy this file to server/targets.config.json (keep it git-ignored) and edit it before each OTA push. 'mode' is one of 'all', 'include', or 'exclude'. 'devices' is a list of device names that the publisher looks up in MongoDB; the names must match the 'name' field on the device documents exactly. For 'all', 'devices' is ignored.",
+
+  "mode": "include",
+  "devices": [
+    "thermopile-lab-01",
+    "thermopile-lab-02"
+  ]
+}

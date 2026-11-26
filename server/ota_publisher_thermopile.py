@@ -14,15 +14,30 @@ import paho.mqtt.client as paho
 from dotenv import dotenv_values
 
 from app_env_source import APP_ENV_ARCHIVE_NAME, APP_ENV_SOURCE_PATH, validate_app_env_source
+from device_targeting import (
+    MONGO_FIELD_MAC_DEFAULT,
+    MONGO_FIELD_NAME_DEFAULT,
+    TargetingError,
+    build_manifest_targets,
+    confirm_deployment,
+    fetch_devices,
+    load_targets_config,
+    resolve_targets,
+    write_resolved_file,
+)
 
 # =========================
 # Env loader
 # =========================
-PUBLISHER_ENV_PATH = Path(__file__).resolve().parent / "publisher.env"
+SERVER_DIR = Path(__file__).resolve().parent
+PUBLISHER_ENV_PATH = SERVER_DIR / "publisher.env"
+TARGETS_CONFIG_PATH = SERVER_DIR / "targets.config.json"
+TARGETS_RESOLVED_PATH = SERVER_DIR / "targets.resolved.json"
 
 REQUIRED_ENV_KEYS = (
     "REPO_PATHS", "DEVICE_GROUP",
     "MQTT_BROKER", "MQTT_PORT", "MQTT_USERNAME", "MQTT_PASSWORD", "MQTT_BASE_TOPIC",
+    "MONGO_URI", "MONGO_DB", "MONGO_COLLECTION",
 )
 
 
@@ -78,6 +93,12 @@ MQTT_PORT = int(_ENV["MQTT_PORT"])
 MQTT_USERNAME = _ENV["MQTT_USERNAME"]
 MQTT_PASSWORD = _ENV["MQTT_PASSWORD"]
 MQTT_BASE_TOPIC = _ENV["MQTT_BASE_TOPIC"]
+
+MONGO_URI = _ENV["MONGO_URI"]
+MONGO_DB = _ENV["MONGO_DB"]
+MONGO_COLLECTION = _ENV["MONGO_COLLECTION"]
+MONGO_NAME_FIELD = _ENV.get("MONGO_NAME_FIELD") or MONGO_FIELD_NAME_DEFAULT
+MONGO_MAC_FIELD = _ENV.get("MONGO_MAC_FIELD") or MONGO_FIELD_MAC_DEFAULT
 
 # Chunking (many brokers default-limit payloads; 256–512 KB is usually safe)
 CHUNK_SIZE = int(_ENV.get("CHUNK_SIZE") or 256 * 1024)  # 256 KB
@@ -150,7 +171,8 @@ def sha256_of_file(path: Path) -> str:
 # MQTT send utility
 # =========================
 def send_archive_over_mqtt(archive_path: Path, base_topic: str, broker: str, port: int,
-                           username=None, password=None, qos=1, retain_manifest=False, chunk_size=256*1024):
+                           username=None, password=None, qos=1, retain_manifest=False, chunk_size=256*1024,
+                           manifest_targets=None):
     client = paho.Client(client_id="", userdata=None, protocol=paho.MQTTv5)
     client.tls_set(cert_reqs=paho.ssl.CERT_NONE)  # disable CA check (since you're using self-signed)
     client.tls_insecure_set(True)
@@ -180,7 +202,8 @@ def send_archive_over_mqtt(archive_path: Path, base_topic: str, broker: str, por
             "sha256": file_hash,
             "chunk_size": chunk_size,
             "total_chunks": total_chunks,
-            "created_at": int(time.time())
+            "created_at": int(time.time()),
+            "targets": manifest_targets or {"mode": "all"},
         }
 
         # Publish manifest first
@@ -223,6 +246,32 @@ def send_archive_over_mqtt(archive_path: Path, base_topic: str, broker: str, por
 # Main flow
 # =========================
 def main():
+    device_group = _ENV["DEVICE_GROUP"]
+
+    # Resolve the target device set and confirm before touching anything else.
+    # If the user declines (or the config is bad), the publisher exits before
+    # the archive is built or MQTT is contacted.
+    try:
+        targets_config = load_targets_config(TARGETS_CONFIG_PATH)
+        all_devices = fetch_devices(MONGO_URI, MONGO_DB, MONGO_COLLECTION, MONGO_NAME_FIELD, MONGO_MAC_FIELD)
+        if not all_devices:
+            print(f"[error] MongoDB collection '{MONGO_COLLECTION}' has no devices", file=sys.stderr)
+            sys.exit(2)
+        resolved = resolve_targets(targets_config, all_devices)
+    except TargetingError as e:
+        print(f"[error] {e}", file=sys.stderr)
+        sys.exit(2)
+
+    manifest_targets = build_manifest_targets(resolved)
+
+    if not resolved["effective_macs"]:
+        print("[error] Target set is empty, nothing to deploy to.", file=sys.stderr)
+        sys.exit(2)
+
+    if not confirm_deployment(resolved, device_group, manifest_targets):
+        print("[info] Deployment cancelled.")
+        sys.exit(0)
+
     # Validate every repo path up front. Otherwise a bad path mid-list would
     # halt the publish after earlier repos had already gone out.
     resolved_repos = [Path(p).resolve() for p in REPO_PATHS]
@@ -234,22 +283,20 @@ def main():
 
     for repo in resolved_repos:
         try:
-            DEVICE_GROUP = _ENV["DEVICE_GROUP"]
-
             app_env_source = validate_app_env_source(APP_ENV_SOURCE_PATH)
 
             with tempfile.TemporaryDirectory(prefix="repo_bundle_") as tmp:
                 out_dir = Path(tmp)
-                archive_path = make_tar_gz(repo, INCLUDE_PATHS, out_dir, f"{ARCHIVE_BASENAME}-{DEVICE_GROUP}", app_env_source)
+                archive_path = make_tar_gz(repo, INCLUDE_PATHS, out_dir, f"{ARCHIVE_BASENAME}-{device_group}", app_env_source)
                 print(f"[info] Archive created: {archive_path} ({archive_path.stat().st_size} bytes)")
 
                 file_hash = sha256_of_file(archive_path)
                 print(f"[info] SHA256: {file_hash}")
 
-                print(f"[info] Sending over MQTT to {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_BASE_TOPIC}/{DEVICE_GROUP}' ...")
+                print(f"[info] Sending over MQTT to {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_BASE_TOPIC}/{device_group}' ...")
                 result = send_archive_over_mqtt(
                     archive_path=archive_path,
-                    base_topic=MQTT_BASE_TOPIC + f"/{DEVICE_GROUP}",
+                    base_topic=MQTT_BASE_TOPIC + f"/{device_group}",
                     broker=MQTT_BROKER,
                     port=MQTT_PORT,
                     username=MQTT_USERNAME,
@@ -257,7 +304,13 @@ def main():
                     qos=QOS,
                     retain_manifest=RETAIN_MANIFEST,
                     chunk_size=CHUNK_SIZE,
+                    manifest_targets=manifest_targets,
                 )
+
+                # Audit record is written only after the publish succeeds, so
+                # targets.resolved.json always reflects what was actually sent.
+                write_resolved_file(TARGETS_RESOLVED_PATH, device_group, resolved, manifest_targets, archive_path.name)
+                print(f"[info] Target audit written to {TARGETS_RESOLVED_PATH}")
 
                 print("[info] MQTT send complete.")
                 print(json.dumps(result, indent=2))
