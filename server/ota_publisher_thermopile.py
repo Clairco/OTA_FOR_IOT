@@ -25,6 +25,7 @@ from device_targeting import (
     resolve_targets,
     write_resolved_file,
 )
+from ack_capture import DeploymentAckCollector, DEFAULT_ACK_WAIT_SECONDS
 
 # =========================
 # Env loader
@@ -105,6 +106,9 @@ CHUNK_SIZE = int(_ENV.get("CHUNK_SIZE") or 256 * 1024)  # 256 KB
 QOS = int(_ENV.get("QOS") or 1)                  # 0, 1 or 2; use 1 for at-least-once
 RETAIN_MANIFEST = _env_bool(_ENV, "RETAIN_MANIFEST", False)  # typically False for updates
 
+ACK_WAIT_SECONDS = int(_ENV.get("ACK_WAIT_SECONDS") or DEFAULT_ACK_WAIT_SECONDS)
+REPORTS_DIR = SERVER_DIR / "reports"
+
 # =========================
 # Helpers
 # =========================
@@ -172,7 +176,9 @@ def sha256_of_file(path: Path) -> str:
 # =========================
 def send_archive_over_mqtt(archive_path: Path, base_topic: str, broker: str, port: int,
                            username=None, password=None, qos=1, retain_manifest=False, chunk_size=256*1024,
-                           manifest_targets=None):
+                           manifest_targets=None, expected_targets=None,
+                           ack_wait_seconds=DEFAULT_ACK_WAIT_SECONDS,
+                           reports_dir=None, group="thermopile"):
     client = paho.Client(client_id="", userdata=None, protocol=paho.MQTTv5)
     client.tls_set(cert_reqs=paho.ssl.CERT_NONE)  # disable CA check (since you're using self-signed)
     client.tls_insecure_set(True)
@@ -193,6 +199,15 @@ def send_archive_over_mqtt(archive_path: Path, base_topic: str, broker: str, por
 
         session_id = str(uuid.uuid4())
         topic_prefix = f"{base_topic}/{session_id}"
+
+        collector = DeploymentAckCollector(
+            group=group,
+            session_id=session_id,
+            expected_targets=expected_targets,
+            reports_dir=reports_dir,
+            wait_seconds=ack_wait_seconds,
+        )
+        collector.attach(client)
 
         manifest = {
             "type": "manifest",
@@ -231,12 +246,19 @@ def send_archive_over_mqtt(archive_path: Path, base_topic: str, broker: str, por
         info = client.publish(f"{topic_prefix}/complete", json.dumps(complete), qos=qos)
         info.wait_for_publish()
 
+        print(f"[info] Waiting up to {ack_wait_seconds}s for device acks ...")
+        ack_summary = collector.wait()
+        report_path = collector.write_xlsx()
+        print(f"[info] Ack report: {report_path}  ({ack_summary})")
+
         return {
             "session_id": session_id,
             "topic_prefix": topic_prefix,
             "sha256": file_hash,
             "total_chunks": total_chunks,
             "size_bytes": total_size,
+            "ack_summary": ack_summary,
+            "ack_report": str(report_path),
         }
     finally:
         client.loop_stop()
@@ -293,6 +315,11 @@ def main():
                 file_hash = sha256_of_file(archive_path)
                 print(f"[info] SHA256: {file_hash}")
 
+                if resolved["config_mode"] != "all":
+                    expected_targets = resolved["requested_devices"]
+                else:
+                    expected_targets = [{"name": m, "mac": m} for m in resolved["effective_macs"]]
+
                 print(f"[info] Sending over MQTT to {MQTT_BROKER}:{MQTT_PORT} topic '{MQTT_BASE_TOPIC}/{device_group}' ...")
                 result = send_archive_over_mqtt(
                     archive_path=archive_path,
@@ -305,6 +332,10 @@ def main():
                     retain_manifest=RETAIN_MANIFEST,
                     chunk_size=CHUNK_SIZE,
                     manifest_targets=manifest_targets,
+                    expected_targets=expected_targets,
+                    ack_wait_seconds=ACK_WAIT_SECONDS,
+                    reports_dir=REPORTS_DIR,
+                    group=f"thermopile-{device_group}",
                 )
 
                 # Audit record is written only after the publish succeeds, so

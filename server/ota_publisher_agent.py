@@ -39,6 +39,7 @@ from device_targeting import (
     resolve_targets,
     write_resolved_file,
 )
+from ack_capture import DeploymentAckCollector, DEFAULT_ACK_WAIT_SECONDS
 
 # =========================
 # Paths and layout
@@ -284,7 +285,9 @@ def sha256_of_file(path: Path) -> str:
 # MQTT publish (chunked, same shape as the normal publisher)
 # =========================
 def send_bundle_over_mqtt(archive_path: Path, broker: str, port: int, username: str, password: str,
-                          qos: int, chunk_size: int, manifest_targets: dict) -> dict:
+                          qos: int, chunk_size: int, manifest_targets: dict,
+                          expected_targets: list, ack_wait_seconds: int,
+                          reports_dir: Path, group: str) -> dict:
     client = paho.Client(client_id="", userdata=None, protocol=paho.MQTTv5)
     client.tls_set(cert_reqs=paho.ssl.CERT_NONE)
     client.tls_insecure_set(True)
@@ -301,6 +304,15 @@ def send_bundle_over_mqtt(archive_path: Path, broker: str, port: int, username: 
 
         session_id = str(uuid.uuid4())
         topic_prefix = f"{AGENT_OTA_TOPIC}/{session_id}"
+
+        collector = DeploymentAckCollector(
+            group=group,
+            session_id=session_id,
+            expected_targets=expected_targets,
+            reports_dir=reports_dir,
+            wait_seconds=ack_wait_seconds,
+        )
+        collector.attach(client)
 
         manifest = {
             "type": "manifest",
@@ -332,12 +344,19 @@ def send_bundle_over_mqtt(archive_path: Path, broker: str, port: int, username: 
         info = client.publish(f"{topic_prefix}/complete", json.dumps(complete), qos=qos)
         info.wait_for_publish()
 
+        print(f"[info] Waiting up to {ack_wait_seconds}s for device acks ...")
+        ack_summary = collector.wait()
+        report_path = collector.write_xlsx()
+        print(f"[info] Ack report: {report_path}  ({ack_summary})")
+
         return {
             "session_id": session_id,
             "topic_prefix": topic_prefix,
             "sha256": file_hash,
             "total_chunks": total_chunks,
             "size_bytes": total_size,
+            "ack_summary": ack_summary,
+            "ack_report": str(report_path),
         }
     finally:
         client.loop_stop()
@@ -448,6 +467,12 @@ def main():
         print(f"[info] Archive built: {archive_path.name} ({archive_path.stat().st_size} bytes)")
         print(f"[info] SHA256: {file_hash}")
 
+        if resolved["config_mode"] != "all":
+            expected_targets = resolved["requested_devices"]
+        else:
+            expected_targets = [{"name": m, "mac": m} for m in effective_macs]
+        ack_wait_seconds = int(env_values.get("ACK_WAIT_SECONDS") or DEFAULT_ACK_WAIT_SECONDS)
+
         print(f"[info] Publishing to {env_values['MQTT_BROKER']}:{env_values['MQTT_PORT']} topic '{AGENT_OTA_TOPIC}' ...")
         try:
             result = send_bundle_over_mqtt(
@@ -459,6 +484,10 @@ def main():
                 qos=args.qos,
                 chunk_size=args.chunk_size,
                 manifest_targets=manifest_targets,
+                expected_targets=expected_targets,
+                ack_wait_seconds=ack_wait_seconds,
+                reports_dir=SERVER_DIR / "reports",
+                group="ota_agent",
             )
         except Exception as e:
             _audit("failed", reason=f"{type(e).__name__}: {e}")
@@ -471,6 +500,8 @@ def main():
             sha256=file_hash,
             target_count=len(effective_macs),
             bundle=archive_path.name,
+            ack_summary=result.get("ack_summary"),
+            ack_report=result.get("ack_report"),
         )
         print(f"[info] Target audit written to {AGENT_TARGETS_RESOLVED_PATH}")
         print("[info] Publish complete.")
