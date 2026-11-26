@@ -8,6 +8,7 @@ import hashlib
 import platform
 import re
 import subprocess
+import signal
 import sys
 import threading
 import traceback
@@ -1271,4 +1272,13 @@ if __name__ == "__main__":
         traceback.print_exc()
         sys.exit(EXIT_CODE_CONFIG_ERROR)
 
-    client.loop_forever()
+    # pm2 restart (used by the agent self-update flow) sends SIGINT then
+    # SIGTERM. Handle both so shutdown is quiet in the logs and paho gets to
+    # send a clean MQTT DISCONNECT instead of just dropping the TCP socket.
+    signal.signal(signal.SIGTERM, lambda *_: client.disconnect())
+    try:
+        client.loop_forever()
+    except KeyboardInterrupt:
+        print("[info] Shutting down on signal.")
+    finally:
+        client.disconnect()
