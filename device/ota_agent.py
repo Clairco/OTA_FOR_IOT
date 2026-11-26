@@ -434,7 +434,7 @@ def restore_env_backup(env_path: Path) -> bool:
 # Acknowledgement
 # ==============================
 def publish_ack(client, status: str, **details):
-    payload = {"mac_Id": MAC_ADDRESS, "status": status, **details}
+    payload = {"mac": MAC_ADDRESS, "status": status, **details}
     client.publish(ACK_TOPIC, payload=json.dumps(payload), qos=ACK_QOS)
 
 # ==============================
