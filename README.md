@@ -15,7 +15,8 @@ server/ota_publisher_*.py ──► ota/updates/<target>/... ──► device/ot
 | ------------------------------------ | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | `server/ota_publisher_thermopile.py` | Developer laptop                        | Packs the thermopile code folder into `repo_bundle-thermopile-<timestamp>.tar.gz` and publishes it to `ota/updates/thermopile`. Reads `targets.config.json` and MongoDB to decide which devices in the group this push targets; prompts for confirmation before publishing. |
 | `server/ota_publisher_pcs.py`        | Developer laptop                        | Same, for PCS (`ota/updates/PCSBLRCLX`). Publishes to every device in the group (no target filter).                                                                                        |
-| `device/ota_agent.py`                | Each device, pm2 process `ota` (verify) | Receives the bundle, checks the manifest's target list, verifies SHA-256, replaces `PROD_DIR`, restarts the pm2 processes      |
+| `server/ota_publisher_agent.py`      | Developer laptop                        | **Agent self-update pipeline.** Ships a new `ota_agent.py` and/or `agent.env` to the fleet over the separate `OTA_AGENT` MQTT topic. Password-gated, requires a typed risk-acknowledgement phrase, and writes an append-only audit log. See [Agent self-update](#agent-self-update-updating-ota_agentpy). |
+| `device/ota_agent.py`                | Each device, pm2 process `ota` (verify) | Receives the bundle, checks the manifest's target list, verifies SHA-256, replaces `PROD_DIR`, restarts the pm2 processes. Also listens on `OTA_AGENT` for agent self-updates and runs the candidate agent with `--selfcheck` before committing the swap. |
 
 
 
@@ -90,13 +91,91 @@ The thermopile publisher reads `server/targets.config.json` to decide which devi
 
 
 
+## Agent self-update: updating `ota_agent.py`
+
+The normal publisher cannot update the OTA agent itself — the running agent is what receives and applies the bundle, so swapping it out mid-session would break the current session. [`server/ota_publisher_agent.py`](server/ota_publisher_agent.py) is a separate pipeline that handles this, with extra safeguards because a broken release here requires **physical access to every affected device** to recover.
+
+```
+laptop                                    MQTT broker              device
+server/ota_publisher_agent.py ──► OTA_AGENT/<session>/... ──► device/ota_agent.py
+(password + risk prompt, pack            (separate from the normal           (selfcheck candidate, swap
+ ota_agent.py / agent.env)                ota/updates topic tree)             ota_agent.py + agent.env, restart `ota`)
+```
+
+### What it can ship
+
+A bundle (`agent_bundle-<timestamp>.tar.gz`) with any combination of:
+
+| Bundle entry           | Purpose                                                                |
+| ---------------------- | ---------------------------------------------------------------------- |
+| `ota_agent.py`         | Replacement for the running agent script on each device.               |
+| `agent.env`            | Full replacement `agent.env` (overwrites what's there).                |
+| `agent_env_patch.json` | Diff for `agent.env`: `set`, `set_if_missing`, `remove`, `targets`. Mutually exclusive with `agent.env`. |
+
+At least one of the three must be present. A bundle containing both `agent.env` and `agent_env_patch.json` is rejected on the device.
+
+### First-time setup
+
+1. Decide the list of devices this push will go to — copy `server/agent_targets.config.example.json` to `server/agent_targets.config.json` (git-ignored) and set `mode` + `devices` (same format as [Selective delivery](#selective-delivery-adding-devices-and-picking-a-mode)). This is intentionally a **separate file** from `targets.config.json` so you don't accidentally reuse the last normal-OTA target set.
+2. On the very first run, the publisher sees no `server/agent_publisher.config.json` and prompts you to set the agent-OTA password (min 8 chars). It stores a PBKDF2 hash in that file (git-ignored, `0600` on POSIX).
+   - Rotating the password = delete `server/agent_publisher.config.json` and run the publisher once to re-prompt.
+
+### Publishing
+
+From `server/`, with `publisher.env` already configured (same MQTT + Mongo creds the normal publisher uses):
+
+```bash
+# Ship only a new agent script
+python3 ota_publisher_agent.py --script /path/to/new/ota_agent.py
+
+# Ship only an env change (patch diff)
+python3 ota_publisher_agent.py --agent-env-patch /path/to/agent_env_patch.json
+
+# Ship both
+python3 ota_publisher_agent.py --script /path/to/new/ota_agent.py --agent-env-patch /path/to/agent_env_patch.json
+```
+
+Available flags:
+
+| Flag                  | Required                  | Meaning                                                  |
+| --------------------- | ------------------------- | -------------------------------------------------------- |
+| `--script`            | one of these three        | Path to the new `ota_agent.py`.                          |
+| `--agent-env`         | one of these three        | Path to a full replacement `agent.env`.                  |
+| `--agent-env-patch`   | one of these three        | Path to an `agent_env_patch.json` (mutually exclusive with `--agent-env`). |
+| `--chunk-size`        | optional (default 256 KB) | MQTT chunk size in bytes.                                |
+| `--qos`               | optional (default 1)      | MQTT QoS: 0, 1, or 2.                                    |
+
+The publisher then runs this sequence, aborting on the first failure:
+
+1. **Pre-flight validation** — resolves the input paths; compiles `--script` with `py_compile` to catch syntax errors; validates `--agent-env-patch` JSON structure (`set` / `set_if_missing` / `remove` / `targets` sections only, keys match `^[A-Za-z_][A-Za-z0-9_]*$`, values are strings).
+2. **Password gate** — prompts for the agent-OTA password and compares (`hmac.compare_digest`) against the stored PBKDF2 hash. **No retries**: one wrong entry aborts.
+3. **Target resolution** — reads `agent_targets.config.json`, looks up each `sensorName` in MongoDB, prints the effective MAC list.
+4. **Risk acknowledgement** — prints a warning block and asks you to type the exact phrase `I UNDERSTAND`. Anything else aborts.
+5. **Publish** — builds the tarball, publishes manifest + chunks + complete on `OTA_AGENT/<session_id>/...`. Audit record written to `server/agent_targets.resolved.json`.
+
+Every step (invocation, password accepted, risk acknowledged, published, aborted, failed) is appended as a JSON line to [`server/agent_publisher.audit.log`](server/agent_publisher.audit.log).
+
+### Device-side handling
+
+[`ota_agent.py`](device/ota_agent.py) subscribes to `OTA_AGENT/+/...` in parallel to the normal OTA topic. For each agent-OTA bundle the agent:
+
+1. Verifies SHA-256 and extracts into `agent_staging/` (not `STAGING_DIR`).
+2. Rejects the bundle if it contains **both** `agent.env` and `agent_env_patch.json`.
+3. Spawns the **candidate** `ota_agent.py --selfcheck` as a subprocess. The selfcheck validates imports, both env files, and MQTT broker reachability using a different client-id suffix so it doesn't kick the running agent off the broker. Non-zero exit codes map to specific failure reasons in the ack (`agent_env_missing`, `agent_env_invalid`, `app_env_missing`, `mqtt_connect`, …).
+4. On selfcheck success: swaps `ota_agent.py` and `agent.env` atomically (with `.bak` copies preserved), acks on `OTA/ack` with `{"module": "ota_agent", "status": "updated"}`, and restarts itself via `pm2 restart ota`.
+5. On any failure: restores from `.bak`, acks with `{"module": "ota_agent", "status": "failed", "stage": ..., "reason": ...}`, and keeps running the old agent.
+
+An incoming agent-OTA manifest is rejected (with an `ACK_STAGE_CONCURRENCY` ack) if **any** other session is already in flight on the device — the self-update defers and the publisher is expected to retry. The guard is one-way: a normal-OTA manifest that arrives mid-agent-OTA is not rejected, because agent OTA is the high-risk pipeline that should step aside.
+
+
+
 ## Read before pushing
 
 - **The whole** `PROD_DIR` **is replaced**, except `app.env`, `app.env.bak`, `logs/` and `iot_data.db`, which stay on the device. The bundle contains whatever is in your local folder (uncommitted edits), so clean the folder first.
 - **`app.env` comes from `server/app.env`, not from the code folder.** Paste it there before publishing (it is git-ignored). A device with no `app.env` gets a copy of it; a device that has one keeps its own and only takes an `env_patch.json` from the bundle.
 - **No git check:** the publisher always ships the current folder, whatever branch it's on.
 - **Only** `scheduler`**,** `app` **and** `MQTT_Control_Consumer` **are restarted,** then the agent itself (`ota`) a few seconds later. `websocketClient` keeps running the old code.
-- **The agent can't update itself:** changing `ota_agent.py` needs SSH or access to the device.
+- **Updating `ota_agent.py` or `agent.env` is a separate pipeline** — the normal publisher cannot ship them. See [Agent self-update](#agent-self-update-updating-ota_agentpy).
 - **Devices that are offline during a push don't get the update.** Push again once they're back.
 - **New Python dependencies aren't installed.** Install them on the device by hand.
 

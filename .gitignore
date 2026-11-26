@@ -3,6 +3,16 @@
 *.env
 !.env.example
 
+# OTA targeting (names real devices; audit of each push)
+server/targets.config.json
+server/targets.resolved.json
+
+# Agent-OTA publisher (password hash, resolved targets, audit log)
+server/agent_publisher.config.json
+server/agent_targets.config.json
+server/agent_targets.resolved.json
+server/agent_publisher.audit.log
+
 # Python
 __pycache__/
 *.py[cod]
